@@ -49,6 +49,7 @@ import {
   InsporaBadge,
   TabItem,
 } from "@/components/ui/inspora-primitives";
+import { PwaInstallControl } from "@/components/PwaInstallControl";
 
 // Client-only dynamic loading of editor to exclude pdfjs-dist from Node.js SSR
 const PdfEditor = dynamic(
@@ -206,6 +207,40 @@ export default function HomePage() {
               await handleLoadSmartyBunnySample(true);
             }
           }
+
+          // Handle mobile Share Target PDF (?shared=1 from sw.ts)
+          if (params.get("shared") === "1" && "caches" in window) {
+            try {
+              const cache = await caches.open("vibepdf-share-target");
+              const res = await cache.match("/__shared-pdf__");
+              if (res) {
+                const rawName = res.headers.get("X-File-Name");
+                const fileName = rawName ? decodeURIComponent(rawName) : "Shared Document.pdf";
+                const buffer = await res.arrayBuffer();
+                await cache.delete("/__shared-pdf__");
+                const info = await pdfWorker.inspectPdf(buffer);
+                const blob = new Blob([buffer], { type: "application/pdf" });
+                const docId = `doc_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+                const sharedDoc: LocalDocument = {
+                  id: docId,
+                  title: fileName,
+                  blob,
+                  pageCount: info.pageCount || 1,
+                  sizeBytes: buffer.byteLength,
+                  updatedAt: Date.now(),
+                  createdAt: Date.now(),
+                };
+                await saveLocalDocument(sharedDoc);
+                const updatedDocs = await listLocalDocuments();
+                setDocuments(updatedDocs);
+                setActiveDoc({ id: docId, blob, title: fileName });
+              }
+            } catch (shareErr) {
+              console.error("[HomePage] Failed to open shared PDF:", shareErr);
+            } finally {
+              window.history.replaceState({}, "", "/");
+            }
+          }
         }
       } catch (err) {
         console.error("[HomePage] Failed to init local documents:", err);
@@ -215,6 +250,41 @@ export default function HomePage() {
     };
 
     initDocs();
+
+    // Desktop PWA OS File Handler (clicking a .pdf directly in File Explorer / Finder)
+    if (typeof window !== "undefined" && "launchQueue" in window && (window as any).launchQueue) {
+      (window as any).launchQueue.setConsumer(async (launchParams: any) => {
+        if (!launchParams?.files || launchParams.files.length === 0) return;
+        try {
+          for (let i = 0; i < launchParams.files.length; i++) {
+            const handle = launchParams.files[i];
+            const file: File = await handle.getFile();
+            if (file && (file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf"))) {
+              const buffer = await file.arrayBuffer();
+              const info = await pdfWorker.inspectPdf(buffer);
+              const blob = new Blob([buffer], { type: "application/pdf" });
+              const docId = `doc_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+              const launchedDoc: LocalDocument = {
+                id: docId,
+                title: file.name,
+                blob,
+                pageCount: info.pageCount || 1,
+                sizeBytes: file.size,
+                updatedAt: Date.now(),
+                createdAt: Date.now(),
+              };
+              await saveLocalDocument(launchedDoc);
+              await refreshDocuments();
+              if (i === 0) {
+                setActiveDoc({ id: docId, blob, title: file.name });
+              }
+            }
+          }
+        } catch (launchErr) {
+          console.error("[HomePage] Failed to open launched OS PDF file:", launchErr);
+        }
+      });
+    }
     setConvexConfigured(isConvexConfigured());
     setConvexUrlInput(getActiveConvexUrl() || "");
 
@@ -555,6 +625,8 @@ export default function HomePage() {
 
           {/* Header Actions */}
           <div className="flex items-center gap-2 overflow-x-auto max-w-full py-0.5">
+            <PwaInstallControl onInstalledToast={(msg) => showToast(msg, "success")} />
+
             {/* Convex Cloud Sync Pill Button */}
             <button
               type="button"

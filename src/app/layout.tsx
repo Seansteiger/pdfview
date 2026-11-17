@@ -32,8 +32,9 @@ export default function RootLayout({
   return (
     <html lang="en" className="dark">
       <head>
+        <link rel="icon" href="/icons/icon-192.png" type="image/png" sizes="192x192" />
         <link rel="icon" href="/icons/icon-192.svg" type="image/svg+xml" />
-        <link rel="apple-touch-icon" href="/icons/icon-192.svg" />
+        <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" sizes="180x180" />
       </head>
       <body className="min-h-screen bg-[#09090b] text-zinc-100 antialiased subpixel-antialiased selection:bg-white/20 selection:text-white">
         <ConvexClientProvider>

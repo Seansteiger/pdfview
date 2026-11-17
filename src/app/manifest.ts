@@ -2,32 +2,41 @@ import type { MetadataRoute } from "next";
 
 export default function manifest(): MetadataRoute.Manifest {
   return {
-    name: "VibePDF Studio — Offline-First PDF Viewer & Editor",
-    short_name: "VibePDF",
-    description: "Pro-grade offline-first PDF viewer, editor, annotator and cloud-synced document workspace.",
+    id: "/",
+    name: "pdfview — Offline-First PDF Studio",
+    short_name: "pdfview",
+    description: "Offline-first PDF viewer, editor, annotator, and page surgery studio.",
     start_url: "/",
+    scope: "/",
     display: "standalone",
     background_color: "#09090b",
     theme_color: "#09090b",
     orientation: "any",
+    categories: ["productivity", "utilities"],
     icons: [
       {
-        src: "/icons/icon-192.svg",
+        src: "/icons/icon-192.png",
         sizes: "192x192",
-        type: "image/svg+xml",
+        type: "image/png",
         purpose: "any",
+      },
+      {
+        src: "/icons/icon-512.png",
+        sizes: "512x512",
+        type: "image/png",
+        purpose: "any",
+      },
+      {
+        src: "/icons/icon-maskable-512.png",
+        sizes: "512x512",
+        type: "image/png",
+        purpose: "maskable",
       },
       {
         src: "/icons/icon-512.svg",
-        sizes: "512x512",
+        sizes: "any",
         type: "image/svg+xml",
         purpose: "any",
-      },
-      {
-        src: "/icons/icon-maskable.svg",
-        sizes: "512x512",
-        type: "image/svg+xml",
-        purpose: "maskable",
       },
     ],
     file_handlers: [
@@ -36,7 +45,15 @@ export default function manifest(): MetadataRoute.Manifest {
         accept: {
           "application/pdf": [".pdf"],
         },
-      },
+        icons: [
+          {
+            src: "/icons/icon-192.png",
+            sizes: "192x192",
+            type: "image/png",
+          },
+        ],
+        launch_type: "single-client",
+      } as any,
     ],
     share_target: {
       action: "/?share-target=true",
