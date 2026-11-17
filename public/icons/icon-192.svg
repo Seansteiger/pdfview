@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" width="192" height="192">
+  <defs>
+    <linearGradient id="bg-192" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#18181b"/>
+      <stop offset="100%" stop-color="#09090b"/>
+    </linearGradient>
+    <linearGradient id="accent-192" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="50%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="192" height="192" rx="42" fill="url(#bg-192)"/>
+  <rect width="190" height="190" x="1" y="1" rx="41" fill="none" stroke="url(#accent-192)" stroke-width="2" stroke-opacity="0.3"/>
+
+  <g transform="translate(44, 36)">
+    <path d="M 0 12 C 0 5.4 5.4 0 12 0 L 72 0 L 104 32 L 104 108 C 104 114.6 98.6 120 92 120 L 12 120 C 5.4 120 0 114.6 0 108 Z" fill="#1e1e24" stroke="url(#accent-192)" stroke-width="3"/>
+    <path d="M 72 0 L 72 32 L 104 32 Z" fill="url(#accent-192)" opacity="0.85"/>
+    <rect x="18" y="48" width="46" height="8" rx="4" fill="url(#accent-192)"/>
+    <rect x="18" y="65" width="68" height="5" rx="2.5" fill="#71717a" opacity="0.7"/>
+    <rect x="18" y="78" width="56" height="5" rx="2.5" fill="#71717a" opacity="0.7"/>
+    <rect x="18" y="91" width="42" height="5" rx="2.5" fill="#71717a" opacity="0.7"/>
+    <circle cx="78" cy="94" r="14" fill="url(#accent-192)"/>
+    <path d="M 74 94 L 77 97 L 83 91" stroke="#ffffff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  </g>
+</svg>

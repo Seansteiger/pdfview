@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg-mask" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#18181b"/>
+      <stop offset="100%" stop-color="#09090b"/>
+    </linearGradient>
+    <linearGradient id="accent-mask" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="50%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Full bleed background for maskable icon safe zone -->
+  <rect width="512" height="512" fill="url(#bg-mask)"/>
+
+  <!-- Centered safe zone graphics (inner 80% circle) -->
+  <g transform="translate(136, 116)">
+    <path d="M 0 24 C 0 10.7 10.7 0 24 0 L 160 0 L 240 80 L 240 256 C 240 269.3 229.3 280 216 280 L 24 280 C 10.7 280 0 269.3 0 256 Z" fill="#1e1e24" stroke="url(#accent-mask)" stroke-width="6"/>
+    <path d="M 160 0 L 160 80 L 240 80 Z" fill="url(#accent-mask)" opacity="0.85"/>
+    <rect x="36" y="110" width="100" height="18" rx="9" fill="url(#accent-mask)"/>
+    <rect x="36" y="150" width="160" height="10" rx="5" fill="#71717a" opacity="0.7"/>
+    <rect x="36" y="176" width="130" height="10" rx="5" fill="#71717a" opacity="0.7"/>
+    <rect x="36" y="202" width="100" height="10" rx="5" fill="#71717a" opacity="0.7"/>
+    <circle cx="180" cy="216" r="30" fill="url(#accent-mask)"/>
+    <path d="M 171 216 L 177 222 L 190 209" stroke="#ffffff" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  </g>
+</svg>

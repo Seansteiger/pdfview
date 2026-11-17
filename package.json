@@ -1,0 +1,39 @@
+{
+  "name": "vibepdf-studio",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint"
+  },
+  "dependencies": {
+    "@dnd-kit/core": "^6.3.1",
+    "@dnd-kit/sortable": "^10.0.0",
+    "@dnd-kit/utilities": "^3.2.2",
+    "@embedpdf/viewer-react": "^3.3.0",
+    "@serwist/next": "^9.5.14",
+    "clsx": "^2.1.1",
+    "convex": "^1.19.0",
+    "idb-keyval": "^6.2.4",
+    "lucide-react": "^1.16.0",
+    "next": "^15.2.0",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^6.5.438",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "tailwind-merge": "^3.0.0"
+  },
+  "devDependencies": {
+    "@serwist/cli": "^9.5.14",
+    "@tailwindcss/postcss": "^4.0.0",
+    "@types/node": "^20.17.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "postcss": "^8.4.49",
+    "serwist": "^9.5.14",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.7.0"
+  }
+}
