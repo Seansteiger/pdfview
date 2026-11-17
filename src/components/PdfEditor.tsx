@@ -24,6 +24,7 @@ import {
   Redo2,
   FileText,
   Eye,
+  PanelLeft,
 } from "lucide-react";
 import {
   pdfWorker,
@@ -94,7 +95,6 @@ export function PdfEditor({
   const [title, setTitle] = useState<string>(initialTitle);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [currentBlob, setCurrentBlob] = useState<Blob>(initialBlob);
-  const [pdfUrl, setPdfUrl] = useState<string>("");
   const [docInfo, setDocInfo] = useState<PdfInspectionInfo | null>(null);
   const [thumbnails, setThumbnails] = useState<string[]>([]);
 
@@ -122,9 +122,14 @@ export function PdfEditor({
   >("view");
   const [currentPageIndex, setCurrentPageIndex] = useState(0);
 
-  // UI Panels
-  const [leftRailOpen, setLeftRailOpen] = useState(true);
+  // UI Panels (all closed by default for distraction-free reading)
+  const [leftRailOpen, setLeftRailOpen] = useState(false);
   const [rightInspectorOpen, setRightInspectorOpen] = useState(false);
+
+  // Memoized viewer layout: close all internal tabs & side panels on initial open
+  const viewerLayout = useCallback((layout: any) => {
+    return layout.tabs("never").panels({ open: false });
+  }, []);
 
   // Modals
   const [isOrganizerOpen, setIsOrganizerOpen] = useState(false);
@@ -139,16 +144,6 @@ export function PdfEditor({
   // Watermark / Stamp form in inspector
   const [watermarkText, setWatermarkText] = useState("CONFIDENTIAL");
   const [redactionLabel, setRedactionLabel] = useState("[REDACTED]");
-
-  // Setup object URL for the viewer
-  useEffect(() => {
-    const url = URL.createObjectURL(currentBlob);
-    setPdfUrl(url);
-
-    return () => {
-      URL.revokeObjectURL(url);
-    };
-  }, [currentBlob]);
 
   // Online / Offline listener
   useEffect(() => {
@@ -178,10 +173,10 @@ export function PdfEditor({
     refreshPdfInfo(currentBlob);
   }, [currentBlob, refreshPdfInfo]);
 
-  // Load real visual thumbnails for left rail
+  // Lazy-render visual thumbnails ONLY when the left Pages rail is toggled open
   useEffect(() => {
     let isMounted = true;
-    if (!currentBlob) return;
+    if (!leftRailOpen || !currentBlob) return;
     (async () => {
       try {
         const thumbs = await renderPdfThumbnails(currentBlob, 0.25);
@@ -193,7 +188,7 @@ export function PdfEditor({
     return () => {
       isMounted = false;
     };
-  }, [currentBlob]);
+  }, [leftRailOpen, currentBlob]);
 
   // Auto-Save Hook integration
   const { saveStatus, lastSavedAt, manualSave } = useAutoSave({
@@ -495,7 +490,7 @@ export function PdfEditor({
       {/* 1. TOP DOCKED TOOL RIBBON (DESKTOP & TABLET >= 768px)     */}
       {/* ========================================================= */}
       <header className="hidden md:flex items-center justify-between px-4 py-2 border-b border-white/[0.08] bg-[#0c0d12] z-30 shrink-0">
-        {/* Left: Back & Title */}
+        {/* Left: Back, Pages Toggle & Title */}
         <div className="flex items-center gap-3">
           <button
             type="button"
@@ -504,6 +499,20 @@ export function PdfEditor({
           >
             <ArrowLeft className="w-3.5 h-3.5" />
             <span>Workspace</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setLeftRailOpen((prev) => !prev)}
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border text-xs font-medium transition-[transform,background-color] duration-150 cursor-pointer active:scale-[0.98] ${
+              leftRailOpen
+                ? "border-white/20 bg-white/[0.12] text-white"
+                : "border-white/10 bg-white/[0.04] text-zinc-400 hover:text-white hover:bg-white/10"
+            }`}
+            title="Toggle Pages Rail"
+          >
+            <PanelLeft className="w-3.5 h-3.5" />
+            <span>Pages</span>
           </button>
 
           <div className="h-4 w-[1px] bg-white/10" />
@@ -731,32 +740,23 @@ export function PdfEditor({
       {/* ========================================================= */}
       <div className="relative flex flex-1 overflow-hidden">
         {/* ------------------------------------------------------- */}
-        {/* Left Rail: Quick Page Surgery & Thumbnails (Collapsible)*/}
+        {/* Left Rail: Quick Page Surgery & Thumbnails (Closed by default) */}
         {/* ------------------------------------------------------- */}
-        <aside
-          className={`hidden md:flex flex-col border-r border-white/[0.08] bg-[#09090b] transition-[width] duration-200 z-20 shrink-0 ${
-            leftRailOpen ? "w-64" : "w-12"
-          }`}
-        >
-          {/* Rail Header */}
-          <div className="flex items-center justify-between px-3 py-2 border-b border-white/[0.08] bg-[#0c0d12]">
-            {leftRailOpen && (
+        {leftRailOpen && (
+          <aside className="hidden md:flex flex-col w-64 border-r border-white/[0.08] bg-[#09090b] z-20 shrink-0 animate-in slide-in-from-left duration-150">
+            {/* Rail Header */}
+            <div className="flex items-center justify-between px-3 py-2 border-b border-white/[0.08] bg-[#0c0d12]">
               <span className="text-xs font-semibold text-zinc-300">Pages</span>
-            )}
-            <button
-              type="button"
-              onClick={() => setLeftRailOpen(!leftRailOpen)}
-              className="p-1 rounded text-zinc-400 hover:text-white hover:bg-white/10 transition-colors ml-auto cursor-pointer"
-            >
-              {leftRailOpen ? (
+              <button
+                type="button"
+                onClick={() => setLeftRailOpen(false)}
+                className="p-1 rounded text-zinc-400 hover:text-white hover:bg-white/10 transition-colors ml-auto cursor-pointer"
+                title="Close Pages Rail"
+              >
                 <ChevronLeft className="w-4 h-4" />
-              ) : (
-                <ChevronRight className="w-4 h-4" />
-              )}
-            </button>
-          </div>
+              </button>
+            </div>
 
-          {leftRailOpen ? (
             <div className="flex-1 overflow-y-auto p-3 space-y-3">
               {/* Full Organizer Trigger Button */}
               <button
@@ -840,19 +840,8 @@ export function PdfEditor({
                 })}
               </div>
             </div>
-          ) : (
-            <div className="flex-1 flex flex-col items-center py-4 space-y-3">
-              <button
-                type="button"
-                onClick={() => setIsOrganizerOpen(true)}
-                className="p-2 rounded-lg text-zinc-400 hover:text-white hover:bg-white/10"
-                title="Page Grid Organizer"
-              >
-                <Layers className="w-4 h-4 text-zinc-300" />
-              </button>
-            </div>
-          )}
-        </aside>
+          </aside>
+        )}
 
         {/* ------------------------------------------------------- */}
         {/* Center: High-DPI PDFium WebAssembly Viewport            */}
@@ -860,10 +849,13 @@ export function PdfEditor({
         {/* obscures PDF page content or controls!                  */}
         {/* ------------------------------------------------------- */}
         <main className="relative flex-1 h-full w-full bg-[#121318] overflow-hidden flex flex-col pb-20 md:pb-0">
-          {pdfUrl ? (
+          {currentBlob ? (
             <div className="w-full h-full relative">
               <PDFViewer
-                src={pdfUrl}
+                src={currentBlob}
+                theme="dark"
+                layout={viewerLayout}
+                warnBeforeLeaving={false}
                 style={{
                   width: "100%",
                   height: "100%",

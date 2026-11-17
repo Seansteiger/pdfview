@@ -181,14 +181,7 @@ export default function HomePage() {
   useEffect(() => {
     const initDocs = async () => {
       try {
-        let docs = await listLocalDocuments();
-        // Auto-seed sample if IndexedDB is empty on initial load
-        if (docs.length === 0) {
-          const seeded = await handleLoadSmartyBunnySample(false);
-          if (seeded) {
-            docs = [seeded];
-          }
-        }
+        const docs = await listLocalDocuments();
         setDocuments(docs);
 
         // Check query parameters (e.g., ?loadSample=smarty-bunny)
@@ -216,24 +209,24 @@ export default function HomePage() {
               if (res) {
                 const rawName = res.headers.get("X-File-Name");
                 const fileName = rawName ? decodeURIComponent(rawName) : "Shared Document.pdf";
-                const buffer = await res.arrayBuffer();
+                const blob = await res.blob();
                 await cache.delete("/__shared-pdf__");
-                const info = await pdfWorker.inspectPdf(buffer);
-                const blob = new Blob([buffer], { type: "application/pdf" });
                 const docId = `doc_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-                const sharedDoc: LocalDocument = {
-                  id: docId,
-                  title: fileName,
-                  blob,
-                  pageCount: info.pageCount || 1,
-                  sizeBytes: buffer.byteLength,
-                  updatedAt: Date.now(),
-                  createdAt: Date.now(),
-                };
-                await saveLocalDocument(sharedDoc);
-                const updatedDocs = await listLocalDocuments();
-                setDocuments(updatedDocs);
                 setActiveDoc({ id: docId, blob, title: fileName });
+                // Inspect and persist in background without delaying open
+                blob.arrayBuffer().then(async (buffer) => {
+                  const info = await pdfWorker.inspectPdf(buffer).catch(() => ({ pageCount: 1 }));
+                  await saveLocalDocument({
+                    id: docId,
+                    title: fileName,
+                    blob,
+                    pageCount: info.pageCount || 1,
+                    sizeBytes: blob.size,
+                    updatedAt: Date.now(),
+                    createdAt: Date.now(),
+                  });
+                  refreshDocuments();
+                });
               }
             } catch (shareErr) {
               console.error("[HomePage] Failed to open shared PDF:", shareErr);
@@ -251,6 +244,12 @@ export default function HomePage() {
 
     initDocs();
 
+    // Background idle pre-warming of PdfEditor & @embedpdf/viewer-react chunks
+    const warmTimer = setTimeout(() => {
+      import("@/components/PdfEditor").catch(() => {});
+      import("@embedpdf/viewer-react").catch(() => {});
+    }, 350);
+
     // Desktop PWA OS File Handler (clicking a .pdf directly in File Explorer / Finder)
     if (typeof window !== "undefined" && "launchQueue" in window && (window as any).launchQueue) {
       (window as any).launchQueue.setConsumer(async (launchParams: any) => {
@@ -260,24 +259,23 @@ export default function HomePage() {
             const handle = launchParams.files[i];
             const file: File = await handle.getFile();
             if (file && (file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf"))) {
-              const buffer = await file.arrayBuffer();
-              const info = await pdfWorker.inspectPdf(buffer);
-              const blob = new Blob([buffer], { type: "application/pdf" });
               const docId = `doc_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-              const launchedDoc: LocalDocument = {
-                id: docId,
-                title: file.name,
-                blob,
-                pageCount: info.pageCount || 1,
-                sizeBytes: file.size,
-                updatedAt: Date.now(),
-                createdAt: Date.now(),
-              };
-              await saveLocalDocument(launchedDoc);
-              await refreshDocuments();
               if (i === 0) {
-                setActiveDoc({ id: docId, blob, title: file.name });
+                setActiveDoc({ id: docId, blob: file, title: file.name });
               }
+              file.arrayBuffer().then(async (buffer) => {
+                const info = await pdfWorker.inspectPdf(buffer).catch(() => ({ pageCount: 1 }));
+                await saveLocalDocument({
+                  id: docId,
+                  title: file.name,
+                  blob: file,
+                  pageCount: info.pageCount || 1,
+                  sizeBytes: file.size,
+                  updatedAt: Date.now(),
+                  createdAt: Date.now(),
+                });
+                refreshDocuments();
+              });
             }
           }
         } catch (launchErr) {
@@ -294,36 +292,33 @@ export default function HomePage() {
     };
     window.addEventListener("vibepdf-convex-url-changed", handleUrlChange);
     return () => {
+      clearTimeout(warmTimer);
       window.removeEventListener("vibepdf-convex-url-changed", handleUrlChange);
     };
-  }, [handleLoadSmartyBunnySample]);
+  }, [handleLoadSmartyBunnySample, refreshDocuments]);
 
-  // Open a file into Editor
+  // Open a file into Editor instantaneously without waiting for worker inspection
   const handleOpenFile = async (file: File) => {
     try {
-      setLoading(true);
-      const buffer = await file.arrayBuffer();
-      const info = await pdfWorker.inspectPdf(buffer);
-      const blob = new Blob([buffer], { type: "application/pdf" });
       const docId = `doc_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      setActiveDoc({ id: docId, blob: file, title: file.name });
 
-      const newDoc: LocalDocument = {
-        id: docId,
-        title: file.name,
-        blob,
-        pageCount: info.pageCount || 1,
-        sizeBytes: file.size,
-        updatedAt: Date.now(),
-        createdAt: Date.now(),
-      };
-
-      await saveLocalDocument(newDoc);
-      await refreshDocuments();
-      setActiveDoc({ id: docId, blob, title: file.name });
+      // Inspect metadata and persist to IndexedDB in background
+      file.arrayBuffer().then(async (buffer) => {
+        const info = await pdfWorker.inspectPdf(buffer).catch(() => ({ pageCount: 1 }));
+        await saveLocalDocument({
+          id: docId,
+          title: file.name,
+          blob: file,
+          pageCount: info.pageCount || 1,
+          sizeBytes: file.size,
+          updatedAt: Date.now(),
+          createdAt: Date.now(),
+        });
+        refreshDocuments();
+      });
     } catch (err: any) {
       showToast(`Could not open PDF: ${err.message}`, "error");
-    } finally {
-      setLoading(false);
     }
   };
 
