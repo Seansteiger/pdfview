@@ -7,6 +7,11 @@
   --card-elevated: #161618;
   --card-border: rgba(255, 255, 255, 0.08);
   --hairline-bevel: inset 0 1px 0 0 rgba(255, 255, 255, 0.06);
+  /* Calibrated paper-blended AcroForm field appearance */
+  --epdf-form-focus: rgba(24, 24, 27, 0.45);
+  --epdf-form-field-border: rgba(24, 24, 27, 0.16);
+  --epdf-form-field-background: rgba(24, 24, 27, 0.025);
+  --epdf-form-field-color: #18181b;
 }
 
 @theme {

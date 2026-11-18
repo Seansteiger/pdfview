@@ -40,7 +40,11 @@ import {
 import {
   detectFormFieldsOnPage,
   detectFormFieldsAllPages,
+  detectPageTypography,
+  toEmbedPdfFontFamily,
   type DetectedFieldDraft,
+  type PageTypography,
+  type StandardPdfFont,
 } from "@/lib/formDetector";
 
 export interface FormFillerPanelProps {
@@ -60,6 +64,40 @@ export interface FormFillerPanelProps {
 
 type PanelTab = "fill" | "build" | "profile";
 type FieldFilterMode = "all" | "empty" | "required";
+type FontPreference = "auto" | StandardPdfFont;
+type FontSizePreference = 0 | 9 | 10 | 11 | 12 | 14;
+type InkPresetId = "carbon" | "archival" | "navy";
+
+const INK_PRESETS: Record<
+  InkPresetId,
+  { label: string; shortLabel: string; color: string; dotStyle: string }
+> = {
+  carbon: {
+    label: "Carbon Print",
+    shortLabel: "Carbon",
+    color: "#18181b",
+    dotStyle: "bg-[#18181b] border-zinc-400/70",
+  },
+  archival: {
+    label: "Archival Black",
+    shortLabel: "Archival",
+    color: "#09090b",
+    dotStyle: "bg-[#09090b] border-zinc-300/80",
+  },
+  navy: {
+    label: "Ballpoint Navy",
+    shortLabel: "Navy",
+    color: "#1e3a5f",
+    dotStyle: "bg-[#1e3a5f] border-sky-300/60",
+  },
+};
+
+function fontFamilyToCssClass(font?: string | null): string {
+  const lower = (font || "").toLowerCase();
+  if (lower.includes("times") || lower.includes("serif")) return "font-serif";
+  if (lower.includes("courier") || lower.includes("mono")) return "font-mono";
+  return "font-sans";
+}
 
 interface RectBox {
   x: number;
@@ -132,6 +170,13 @@ export function FormFillerPanel({
   const [searchQuery, setSearchQuery] = useState("");
   const [filterMode, setFilterMode] = useState<FieldFilterMode>("all");
 
+  // Document-Matched Typography & Ink Texture settings
+  const [fontPref, setFontPref] = useState<FontPreference>("auto");
+  const [fontSizePref, setFontSizePref] = useState<FontSizePreference>(0);
+  const [inkPreset, setInkPreset] = useState<InkPresetId>("carbon");
+  const [detectedTypography, setDetectedTypography] = useState<PageTypography | null>(null);
+  const [isHarmonizing, setIsHarmonizing] = useState(false);
+
   // Controlled-input draft buffer & debounce refs (eliminates cursor jump & async race)
   const [localTextValues, setLocalTextValues] = useState<Record<string, string>>({});
   const [focusedFieldName, setFocusedFieldName] = useState<string | null>(null);
@@ -166,6 +211,28 @@ export function FormFillerPanel({
       }
     }
   }, [isOpen, fields.length]);
+
+  // Detect dominant page font & median label size whenever active page or PDF changes
+  useEffect(() => {
+    if (!isOpen || !pdfBlob) return;
+    let active = true;
+    detectPageTypography(pdfBlob, currentPageIndex)
+      .then((typo) => {
+        if (active) setDetectedTypography(typo);
+      })
+      .catch(() => {
+        // Keep previous or fallback typography
+      });
+    return () => {
+      active = false;
+    };
+  }, [isOpen, pdfBlob, currentPageIndex]);
+
+  const effectiveFontFamily: StandardPdfFont =
+    fontPref === "auto" ? (detectedTypography?.fontFamily ?? "Helvetica") : fontPref;
+  const effectiveFontSize: number =
+    fontSizePref === 0 ? (detectedTypography?.fontSize ?? 11) : fontSizePref;
+  const effectiveInkColor: string = INK_PRESETS[inkPreset].color;
 
   const fillableFields = useMemo(
     () => fields.filter((f) => f.kind !== "pushbutton"),
@@ -229,6 +296,25 @@ export function FormFillerPanel({
     }
     return map;
   }, [viewer, fillableFields, getForm]);
+
+  // Map each field name -> Tailwind font class mirroring its widget's typeface or detected page font
+  const fieldFontClassMap = useMemo(() => {
+    const map: Record<string, string> = {};
+    const form = getForm();
+    const fallbackClass = fontFamilyToCssClass(effectiveFontFamily);
+    for (const field of fillableFields) {
+      let widgetFont: string | null | undefined = null;
+      if (form) {
+        try {
+          widgetFont = form.getWidgets(field.ref)?.[0]?.fontFamily ?? null;
+        } catch {
+          widgetFont = null;
+        }
+      }
+      map[field.name] = widgetFont ? fontFamilyToCssClass(widgetFont) : fallbackClass;
+    }
+    return map;
+  }, [fillableFields, getForm, effectiveFontFamily]);
 
   const isFieldEmpty = useCallback(
     (field: FormField): boolean => {
@@ -585,6 +671,97 @@ export function FormFillerPanel({
     }
   };
 
+  const handleHarmonizeAllFieldStyles = async () => {
+    const form = getForm();
+    if (!form || !viewer) return;
+
+    setIsHarmonizing(true);
+    try {
+      const pageTypoCache = new Map<number, PageTypography>();
+      const getPageTypo = async (pageIdx: number): Promise<PageTypography> => {
+        if (pageTypoCache.has(pageIdx)) return pageTypoCache.get(pageIdx)!;
+        if (pdfBlob) {
+          try {
+            const detected = await detectPageTypography(pdfBlob, pageIdx);
+            pageTypoCache.set(pageIdx, detected);
+            return detected;
+          } catch {
+            // Fall through to current page/default typography
+          }
+        }
+        const fallback: PageTypography = detectedTypography ?? {
+          fontFamily: "Helvetica",
+          fontSize: 11,
+        };
+        pageTypoCache.set(pageIdx, fallback);
+        return fallback;
+      };
+
+      let updatedCount = 0;
+      for (const field of fillableFields) {
+        if (field.kind === "signature") continue;
+        const widgets = form.getWidgets(field.ref);
+        for (const widget of widgets) {
+          let pageIdx = currentPageIndex;
+          try {
+            const idx = viewer.documents.getPageIndex(widget.page);
+            if (idx >= 0) pageIdx = idx;
+          } catch {
+            // Use active page fallback
+          }
+
+          const pageTypo = await getPageTypo(pageIdx);
+          const resolvedFont = toEmbedPdfFontFamily(
+            fontPref === "auto" ? pageTypo.fontFamily : fontPref
+          );
+          const rawSize = fontSizePref === 0 ? pageTypo.fontSize : fontSizePref;
+          const widgetHeight = widget.rect?.height ?? 0;
+          const isMultiline = field.kind === "text" && field.multiline;
+          const resolvedSize =
+            !isMultiline && widgetHeight > 0 && rawSize > widgetHeight * 0.85
+              ? Math.max(8, Math.round(widgetHeight * 0.78 * 2) / 2)
+              : rawSize;
+
+          if (
+            field.kind === "text" ||
+            field.kind === "combobox" ||
+            field.kind === "listbox"
+          ) {
+            await form.updateWidget(widget.ref, {
+              fontFamily: resolvedFont,
+              fontSize: resolvedSize,
+              fontColor: effectiveInkColor,
+              interiorColor: null,
+              strokeWidth: 0,
+              color: null,
+            });
+            updatedCount++;
+          } else if (field.kind === "checkbox" || field.kind === "radio") {
+            await form.updateWidget(widget.ref, {
+              fontColor: effectiveInkColor,
+              interiorColor: null,
+            });
+            updatedCount++;
+          }
+        }
+      }
+
+      onFieldsChanged();
+      if (updatedCount > 0) {
+        onNotify(
+          `Matched ${updatedCount} widget${updatedCount === 1 ? "" : "s"} to ${effectiveFontFamily} · ${effectiveFontSize}pt (${INK_PRESETS[inkPreset].shortLabel}).`,
+          "success"
+        );
+      } else {
+        onNotify("No fillable field widgets found to update.", "info");
+      }
+    } catch (err: any) {
+      onNotify(`Could not match field styles: ${err?.message || "Error"}`, "error");
+    } finally {
+      setIsHarmonizing(false);
+    }
+  };
+
   const createNonOverlappingDetectedDrafts = async (
     drafts: DetectedFieldDraft[]
   ): Promise<{ created: number; skippedOverlaps: number; pageSet: Set<number> }> => {
@@ -650,12 +827,20 @@ export function FormFillerPanel({
               {
                 page: targetPage.ref,
                 rect: draft.rect,
-                borderStyle: "solid",
-                strokeWidth: 1,
+                borderStyle: draft.style.borderStyle ?? "solid",
+                strokeWidth: draft.style.strokeWidth,
+                color: draft.style.color ?? null,
+                interiorColor: draft.style.interiorColor,
+                fontColor: effectiveInkColor || draft.style.fontColor,
               },
             ],
           });
         } else {
+          const resolvedFont = toEmbedPdfFontFamily(
+            fontPref === "auto" ? draft.style.fontFamily : fontPref
+          );
+          const resolvedFontSize =
+            fontSizePref === 0 ? draft.style.fontSize : fontSizePref;
           await form.create({
             kind: "text",
             name,
@@ -664,9 +849,13 @@ export function FormFillerPanel({
               {
                 page: targetPage.ref,
                 rect: draft.rect,
-                fontSize: 11,
-                borderStyle: "underline",
-                strokeWidth: 1,
+                fontFamily: resolvedFont,
+                fontSize: resolvedFontSize,
+                fontColor: effectiveInkColor || draft.style.fontColor,
+                interiorColor: draft.style.interiorColor,
+                borderStyle: draft.style.borderStyle ?? "solid",
+                strokeWidth: draft.style.strokeWidth,
+                color: draft.style.color ?? null,
               },
             ],
           });
@@ -796,6 +985,23 @@ export function FormFillerPanel({
     const x = 72;
     const y = Math.min(targetPage.size.height - 80, 120 + offsetStep);
 
+    let pageTypo: PageTypography = detectedTypography ?? {
+      fontFamily: "Helvetica",
+      fontSize: 11,
+    };
+    if (pdfBlob && (fontPref === "auto" || fontSizePref === 0)) {
+      try {
+        pageTypo = await detectPageTypography(pdfBlob, safePageIdx);
+      } catch {
+        // Use active page fallback
+      }
+    }
+    const resolvedFont = toEmbedPdfFontFamily(
+      fontPref === "auto" ? pageTypo.fontFamily : fontPref
+    );
+    const resolvedFontSize = fontSizePref === 0 ? pageTypo.fontSize : fontSizePref;
+    const fieldBoxHeight = Math.max(18, Math.round(resolvedFontSize * 1.65));
+
     try {
       let res;
       if (preset === "checkbox") {
@@ -806,9 +1012,12 @@ export function FormFillerPanel({
           widgets: [
             {
               page: targetPage.ref,
-              rect: { x, y, width: 18, height: 18 },
+              rect: { x, y, width: 16, height: 16 },
               borderStyle: "solid",
-              strokeWidth: 1,
+              strokeWidth: 0.75,
+              color: "#71717a",
+              interiorColor: null,
+              fontColor: effectiveInkColor,
             },
           ],
         });
@@ -828,10 +1037,14 @@ export function FormFillerPanel({
           widgets: [
             {
               page: targetPage.ref,
-              rect: { x, y, width: 200, height: 22 },
-              fontSize: 11,
+              rect: { x, y, width: 200, height: fieldBoxHeight },
+              fontFamily: resolvedFont,
+              fontSize: resolvedFontSize,
+              fontColor: effectiveInkColor,
+              interiorColor: null,
               borderStyle: "solid",
-              strokeWidth: 1,
+              strokeWidth: 0.75,
+              color: "#a1a1aa",
             },
           ],
         });
@@ -845,9 +1058,13 @@ export function FormFillerPanel({
             {
               page: targetPage.ref,
               rect: { x, y, width: 260, height: 64 },
-              fontSize: 11,
+              fontFamily: resolvedFont,
+              fontSize: resolvedFontSize,
+              fontColor: effectiveInkColor,
+              interiorColor: null,
               borderStyle: "solid",
-              strokeWidth: 1,
+              strokeWidth: 0.75,
+              color: "#a1a1aa",
             },
           ],
         });
@@ -861,10 +1078,19 @@ export function FormFillerPanel({
           widgets: [
             {
               page: targetPage.ref,
-              rect: { x, y, width: preset === "date" ? 130 : 220, height: 22 },
-              fontSize: 11,
+              rect: {
+                x,
+                y,
+                width: preset === "date" ? 130 : 220,
+                height: fieldBoxHeight,
+              },
+              fontFamily: resolvedFont,
+              fontSize: resolvedFontSize,
+              fontColor: effectiveInkColor,
+              interiorColor: null,
               borderStyle: "solid",
-              strokeWidth: 1,
+              strokeWidth: 0.75,
+              color: "#a1a1aa",
             },
           ],
         });
@@ -973,6 +1199,116 @@ export function FormFillerPanel({
 
       {/* Body */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4 text-xs">
+        {/* ======================================================= */}
+        {/* DOCUMENT-MATCHED TYPOGRAPHY & INK TEXTURE BAR           */}
+        {/* ======================================================= */}
+        {(activeTab === "fill" || activeTab === "build") && (
+          <div className="rounded-[20px] border border-white/[0.08] bg-[#111113] p-3 space-y-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5 min-w-0">
+                <Type className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
+                <span className="text-[11px] font-semibold text-zinc-200 truncate">
+                  Typography &amp; Ink Texture
+                </span>
+              </div>
+              <span className="px-1.5 py-0.5 rounded-md bg-white/[0.05] border border-white/[0.07] text-[10px] font-mono tabular-nums text-zinc-300 shrink-0">
+                {effectiveFontFamily === "Times-Roman"
+                  ? "Times"
+                  : effectiveFontFamily}{" "}
+                · {effectiveFontSize}pt
+              </span>
+            </div>
+
+            {/* Font Family + Font Size */}
+            <div className="flex items-center gap-1.5">
+              <div className="flex-1 grid grid-cols-4 gap-1 p-0.5 rounded-lg bg-black/40 border border-white/[0.07]">
+                {(
+                  [
+                    { id: "auto", label: "Auto" },
+                    { id: "Helvetica", label: "Sans" },
+                    { id: "Times-Roman", label: "Serif" },
+                    { id: "Courier", label: "Mono" },
+                  ] as const
+                ).map((opt) => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => setFontPref(opt.id)}
+                    title={
+                      opt.id === "auto"
+                        ? `Match document (${detectedTypography?.fontFamily ?? "Helvetica"})`
+                        : opt.id
+                    }
+                    className={`py-1 px-1.5 rounded-md text-[10px] font-medium transition-[transform,background-color,color] duration-150 active:scale-[0.98] cursor-pointer ${
+                      fontPref === opt.id
+                        ? "bg-white/[0.14] text-white"
+                        : "text-zinc-400 hover:text-zinc-200"
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+
+              <select
+                aria-label="Form Font Size"
+                value={fontSizePref}
+                onChange={(e) =>
+                  setFontSizePref(Number(e.target.value) as FontSizePreference)
+                }
+                className="px-2 py-1 rounded-lg border border-white/10 bg-black/50 text-[10px] font-mono tabular-nums text-zinc-200 focus:outline-none focus:border-white/30 cursor-pointer"
+              >
+                <option value={0}>Auto pt</option>
+                <option value={9}>9pt</option>
+                <option value={10}>10pt</option>
+                <option value={11}>11pt</option>
+                <option value={12}>12pt</option>
+                <option value={14}>14pt</option>
+              </select>
+            </div>
+
+            {/* Ink Texture Presets & 1-Click Match */}
+            <div className="flex items-center justify-between gap-2 pt-0.5">
+              <div className="flex items-center gap-1">
+                {(Object.keys(INK_PRESETS) as InkPresetId[]).map((presetKey) => {
+                  const preset = INK_PRESETS[presetKey];
+                  const active = inkPreset === presetKey;
+                  return (
+                    <button
+                      key={presetKey}
+                      type="button"
+                      onClick={() => setInkPreset(presetKey)}
+                      title={preset.label}
+                      className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-lg border text-[10px] font-medium transition-[transform,background-color,border-color] duration-150 active:scale-[0.98] cursor-pointer ${
+                        active
+                          ? "border-white/30 bg-white/[0.1] text-white"
+                          : "border-white/[0.07] bg-white/[0.02] text-zinc-400 hover:text-zinc-200"
+                      }`}
+                    >
+                      <span
+                        className={`w-2.5 h-2.5 rounded-full border ${preset.dotStyle}`}
+                      />
+                      <span>{preset.shortLabel}</span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {fillableFields.length > 0 && (
+                <button
+                  type="button"
+                  disabled={isHarmonizing}
+                  onClick={handleHarmonizeAllFieldStyles}
+                  title="Apply matched font, size, ink tone, and transparent paper blending to all form fields"
+                  className="px-2.5 py-1 rounded-lg bg-[#fafafa] text-zinc-950 text-[10px] font-semibold hover:bg-white disabled:opacity-60 transition-[transform,background-color] duration-150 active:scale-[0.98] cursor-pointer shrink-0"
+                >
+                  {isHarmonizing ? "Matching..." : "Match All Fields"}
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* ======================================================= */}
         {/* TAB 1: GUIDED FORM FILLER                               */}
         {/* ======================================================= */}
@@ -1142,6 +1478,8 @@ export function FormFillerPanel({
                       const isFocused = focusedFieldName === field.name;
                       const textDraft =
                         localTextValues[field.name] ?? extractTextValue(field);
+                      const fieldFontClass =
+                        fieldFontClassMap[field.name] || "font-sans";
 
                       return (
                         <div
@@ -1213,7 +1551,7 @@ export function FormFillerPanel({
                                   handleTextDraftChange(field, e.target.value)
                                 }
                                 placeholder={`Enter ${label.toLowerCase()}...`}
-                                className="w-full px-2.5 py-1.5 rounded-lg border border-white/10 bg-black/50 text-xs text-white placeholder:text-zinc-600 focus:outline-none focus:border-white/35 resize-y"
+                                className={`w-full px-2.5 py-1.5 rounded-lg border border-white/10 bg-black/50 text-xs text-white placeholder:text-zinc-600 focus:outline-none focus:border-white/35 resize-y ${fieldFontClass}`}
                               />
                             ) : (
                               <input
@@ -1235,7 +1573,7 @@ export function FormFillerPanel({
                                   }
                                 }}
                                 placeholder={`Enter ${label.toLowerCase()}...`}
-                                className="w-full px-2.5 py-1.5 rounded-lg border border-white/10 bg-black/50 text-xs text-white placeholder:text-zinc-600 focus:outline-none focus:border-white/35"
+                                className={`w-full px-2.5 py-1.5 rounded-lg border border-white/10 bg-black/50 text-xs text-white placeholder:text-zinc-600 focus:outline-none focus:border-white/35 ${fieldFontClass}`}
                               />
                             ))}
 
@@ -1321,7 +1659,7 @@ export function FormFillerPanel({
                                     }
                                   }}
                                   placeholder={`Select or type ${label.toLowerCase()}...`}
-                                  className="w-full px-2.5 py-1.5 rounded-lg border border-white/10 bg-black/60 text-xs text-white placeholder:text-zinc-600 focus:outline-none focus:border-white/35"
+                                  className={`w-full px-2.5 py-1.5 rounded-lg border border-white/10 bg-black/60 text-xs text-white placeholder:text-zinc-600 focus:outline-none focus:border-white/35 ${fieldFontClass}`}
                                 />
                                 <datalist id={`combo-opts-${field.name}`}>
                                   {field.options.map((o) => (
@@ -1342,7 +1680,7 @@ export function FormFillerPanel({
                                 onChange={(e) =>
                                   handleSetFieldValue(field, { value: e.target.value })
                                 }
-                                className="w-full px-2.5 py-1.5 rounded-lg border border-white/10 bg-black/60 text-xs text-white focus:outline-none focus:border-white/35"
+                                className={`w-full px-2.5 py-1.5 rounded-lg border border-white/10 bg-black/60 text-xs text-white focus:outline-none focus:border-white/35 ${fieldFontClass}`}
                               >
                                 <option value="">Select option...</option>
                                 {field.options.map((o) => (

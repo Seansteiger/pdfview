@@ -205,6 +205,19 @@ export function PdfEditor({
       viewerRef.current = viewer;
       setViewerInstance(viewer);
 
+      // Calibrate form field appearance to blend transparently with document paper texture
+      try {
+        const form = viewer.tryGet("form");
+        form?.updateSettings?.({
+          focus: { color: "rgba(24, 24, 27, 0.45)" },
+          fields: {
+            border: "rgba(24, 24, 27, 0.16)",
+            background: "rgba(24, 24, 27, 0.025)",
+            color: "#18181b",
+          },
+        });
+      } catch {}
+
       const refresh = () => syncFormFieldsFromViewer(viewer);
       refresh();
 
