@@ -25,7 +25,10 @@ import {
   FileText,
   Eye,
   PanelLeft,
+  ClipboardList,
 } from "lucide-react";
+import type { Viewer } from "@embedpdf/viewer/core";
+import type { FormField } from "@embedpdf/plugin-form";
 import {
   pdfWorker,
   blobToArrayBuffer,
@@ -56,6 +59,11 @@ const PageOrganizerModal = dynamic(
 
 const SignatureModal = dynamic(
   () => import("./SignatureModal").then((mod) => mod.SignatureModal),
+  { ssr: false }
+);
+
+const FormFillerPanel = dynamic(
+  () => import("./FormFillerPanel").then((mod) => mod.FormFillerPanel),
   { ssr: false }
 );
 
@@ -125,11 +133,57 @@ export function PdfEditor({
   // UI Panels (all closed by default for distraction-free reading)
   const [leftRailOpen, setLeftRailOpen] = useState(false);
   const [rightInspectorOpen, setRightInspectorOpen] = useState(false);
+  const [isFormPanelOpen, setIsFormPanelOpen] = useState(false);
+
+  // Live PDFium Viewer & Form State
+  const viewerRef = useRef<Viewer | null>(null);
+  const [viewerInstance, setViewerInstance] = useState<Viewer | null>(null);
+  const [formFields, setFormFields] = useState<readonly FormField[]>([]);
+
+  const syncFormFieldsFromViewer = useCallback((v?: Viewer | null) => {
+    const target = v || viewerRef.current;
+    if (!target) return;
+    try {
+      const form = target.tryGet("form");
+      if (form) {
+        setFormFields(form.list());
+      } else {
+        setFormFields([]);
+      }
+    } catch {
+      setFormFields([]);
+    }
+  }, []);
+
+  const handleViewerReady = useCallback(
+    (viewer: Viewer) => {
+      viewerRef.current = viewer;
+      setViewerInstance(viewer);
+
+      const refresh = () => syncFormFieldsFromViewer(viewer);
+      refresh();
+
+      try {
+        viewer.documents.onOpened(refresh);
+      } catch {}
+
+      try {
+        viewer.watch(
+          () => viewer.tryGet("form")?.getSnapshot() ?? null,
+          () => refresh(),
+          { immediate: true }
+        );
+      } catch {}
+    },
+    [syncFormFieldsFromViewer]
+  );
 
   // Memoized viewer layout: close all internal tabs & side panels on initial open
   const viewerLayout = useCallback((layout: any) => {
     return layout.tabs("never").panels({ open: false });
   }, []);
+
+  const viewerFeatures = useMemo(() => ({ "forms.building": true }), []);
 
   // Modals
   const [isOrganizerOpen, setIsOrganizerOpen] = useState(false);
@@ -332,11 +386,27 @@ export function PdfEditor({
     }
   };
 
+  // Pull live modified bytes (including filled AcroForms & in-viewer annotations) from PDFium
+  const getEffectivePdfBlob = useCallback(async (): Promise<Blob> => {
+    if (viewerRef.current) {
+      try {
+        const bytes = await viewerRef.current.documents.download();
+        if (bytes && bytes.byteLength > 0) {
+          return new Blob([bytes.buffer as ArrayBuffer], { type: "application/pdf" });
+        }
+      } catch {
+        // Fallback to currentBlob if active doc isn't ready
+      }
+    }
+    return currentBlob;
+  }, [currentBlob]);
+
   // Flatten interactive AcroForm fields Execution
   const executeFlattenDocument = async () => {
     setConfirmFlatten(false);
     try {
-      const buffer = await blobToArrayBuffer(currentBlob);
+      const liveBlob = await getEffectivePdfBlob();
+      const buffer = await blobToArrayBuffer(liveBlob);
       const outBuffer = await pdfWorker.stampAndFlatten(buffer, [], true);
       const newBlob = arrayBufferToBlob(outBuffer);
       await handlePdfUpdated(newBlob, "AcroForms & annotations permanently flattened!");
@@ -345,9 +415,10 @@ export function PdfEditor({
     }
   };
 
-  // Export / Download PDF
-  const handleExportDownload = () => {
-    const url = URL.createObjectURL(currentBlob);
+  // Export / Download PDF (captures filled form fields & annotations)
+  const handleExportDownload = async () => {
+    const liveBlob = await getEffectivePdfBlob();
+    const url = URL.createObjectURL(liveBlob);
     const a = document.createElement("a");
     a.href = url;
     a.download = title.endsWith(".pdf") ? title : `${title}.pdf`;
@@ -358,12 +429,13 @@ export function PdfEditor({
 
   // Native Web Share
   const handleShare = async () => {
+    const liveBlob = await getEffectivePdfBlob();
     if (navigator.share) {
       try {
-        const file = new File([currentBlob], title, { type: "application/pdf" });
+        const file = new File([liveBlob], title, { type: "application/pdf" });
         await navigator.share({
           title,
-          text: `VibePDF Studio document: ${title}`,
+          text: `pdfview document: ${title}`,
           files: [file],
         });
       } catch (err) {
@@ -391,10 +463,11 @@ export function PdfEditor({
     setCloudSyncSuccess(false);
 
     try {
-      const result = await uploadDocumentToCloud(client, currentBlob, {
+      const liveBlob = await getEffectivePdfBlob();
+      const result = await uploadDocumentToCloud(client, liveBlob, {
         title,
         pageCount: docInfo?.pageCount || 1,
-        sizeBytes: currentBlob.size,
+        sizeBytes: liveBlob.size,
         existingCloudDocId: cloudDocId,
       });
 
@@ -584,6 +657,28 @@ export function PdfEditor({
 
           <button
             type="button"
+            onClick={() => {
+              setIsFormPanelOpen((prev) => !prev);
+              if (!isFormPanelOpen) setRightInspectorOpen(false);
+            }}
+            className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium transition-[transform,background-color] duration-150 cursor-pointer active:scale-[0.98] ${
+              isFormPanelOpen
+                ? "bg-white/[0.14] text-white shadow-[inset_0_1px_0_0_rgba(255,255,255,0.15)]"
+                : "text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.03]"
+            }`}
+            title="Guided Form Filler, Auto-Detect & Autofill"
+          >
+            <ClipboardList className="w-3.5 h-3.5 text-zinc-300" />
+            <span>Fill Form</span>
+            {formFields.length > 0 && (
+              <span className="px-1.5 py-0.2 rounded-full text-[10px] font-mono tabular-nums bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                {formFields.length}
+              </span>
+            )}
+          </button>
+
+          <button
+            type="button"
             onClick={() => setIsSignatureOpen(true)}
             className="flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.03] transition-[transform,background-color] duration-150 cursor-pointer active:scale-[0.98]"
           >
@@ -673,7 +768,11 @@ export function PdfEditor({
           {/* Inspector Panel Toggle */}
           <button
             type="button"
-            onClick={() => setRightInspectorOpen(!rightInspectorOpen)}
+            onClick={() => {
+              const next = !rightInspectorOpen;
+              setRightInspectorOpen(next);
+              if (next) setIsFormPanelOpen(false);
+            }}
             className={`p-1.5 rounded-xl border text-xs transition-all cursor-pointer ${
               rightInspectorOpen
                 ? "border-white/20 bg-white/[0.1] text-white"
@@ -855,6 +954,8 @@ export function PdfEditor({
                 src={currentBlob}
                 theme="dark"
                 layout={viewerLayout}
+                features={viewerFeatures}
+                onReady={handleViewerReady}
                 warnBeforeLeaving={false}
                 style={{
                   width: "100%",
@@ -966,6 +1067,22 @@ export function PdfEditor({
             </div>
           </aside>
         )}
+
+        {/* ------------------------------------------------------- */}
+        {/* Right Rail: Smart Form Studio Drawer (Closed by default) */}
+        {/* ------------------------------------------------------- */}
+        <FormFillerPanel
+          isOpen={isFormPanelOpen}
+          onClose={() => setIsFormPanelOpen(false)}
+          viewer={viewerInstance}
+          pdfBlob={currentBlob}
+          currentPageIndex={currentPageIndex}
+          fields={formFields}
+          onFieldsChanged={() => syncFormFieldsFromViewer()}
+          onFlattenRequest={() => setConfirmFlatten(true)}
+          onOpenSignature={() => setIsSignatureOpen(true)}
+          onNotify={showToast}
+        />
       </div>
 
       {/* ========================================================= */}
@@ -982,6 +1099,25 @@ export function PdfEditor({
             title="Select"
           >
             <Eye className="w-4 h-4" />
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setIsFormPanelOpen((prev) => !prev);
+              if (!isFormPanelOpen) setRightInspectorOpen(false);
+            }}
+            className={`relative p-2 rounded-full transition-all cursor-pointer ${
+              isFormPanelOpen ? "bg-white/20 text-white" : "text-zinc-400 hover:text-white"
+            }`}
+            title="Fill Form"
+          >
+            <ClipboardList className="w-4 h-4" />
+            {formFields.length > 0 && (
+              <span className="absolute -top-0.5 -right-0.5 w-4 h-4 rounded-full bg-emerald-500 text-[9px] font-bold text-zinc-950 flex items-center justify-center tabular-nums">
+                {formFields.length}
+              </span>
+            )}
           </button>
 
           <button

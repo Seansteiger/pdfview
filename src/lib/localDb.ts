@@ -49,9 +49,26 @@ export interface SavedSignature {
   createdAt: number;
 }
 
+export interface AutofillProfile {
+  fullName: string;
+  firstName: string;
+  lastName: string;
+  email: string;
+  phone: string;
+  company: string;
+  jobTitle: string;
+  address: string;
+  city: string;
+  postalCode: string;
+  country: string;
+  idNumber: string;
+  updatedAt: number;
+}
+
 // Stores for documents and user e-signatures with isolated DB names to avoid idb-keyval onupgradeneeded collision
 const docStore = typeof window !== "undefined" ? createStore("vibepdf-docs-db", "documents") : null!;
 const sigStore = typeof window !== "undefined" ? createStore("vibepdf-sigs-db", "signatures") : null!;
+const profileStore = typeof window !== "undefined" ? createStore("vibepdf-profile-db", "profile") : null!;
 
 /**
  * Saves or updates a document in local IndexedDB.
@@ -170,4 +187,53 @@ export async function deleteSignature(id: string): Promise<void> {
   } catch (err) {
     console.warn("[localDb] Failed to delete signature from IndexedDB:", err);
   }
+}
+
+const DEFAULT_PROFILE_KEY = "default_autofill_profile";
+
+export const EMPTY_AUTOFILL_PROFILE: AutofillProfile = {
+  fullName: "",
+  firstName: "",
+  lastName: "",
+  email: "",
+  phone: "",
+  company: "",
+  jobTitle: "",
+  address: "",
+  city: "",
+  postalCode: "",
+  country: "",
+  idNumber: "",
+  updatedAt: 0,
+};
+
+/**
+ * Loads the user's local Autofill Identity Profile from IndexedDB.
+ */
+export async function getAutofillProfile(): Promise<AutofillProfile> {
+  if (!profileStore) return { ...EMPTY_AUTOFILL_PROFILE };
+  try {
+    const saved = await get<AutofillProfile>(DEFAULT_PROFILE_KEY, profileStore);
+    return saved ? { ...EMPTY_AUTOFILL_PROFILE, ...saved } : { ...EMPTY_AUTOFILL_PROFILE };
+  } catch (err) {
+    console.warn("[localDb] getAutofillProfile failed:", err);
+    return { ...EMPTY_AUTOFILL_PROFILE };
+  }
+}
+
+/**
+ * Saves the user's local Autofill Identity Profile to IndexedDB.
+ */
+export async function saveAutofillProfile(profile: AutofillProfile): Promise<AutofillProfile> {
+  const next: AutofillProfile = {
+    ...profile,
+    updatedAt: Date.now(),
+  };
+  if (!profileStore) return next;
+  try {
+    await set(DEFAULT_PROFILE_KEY, next, profileStore);
+  } catch (err) {
+    console.warn("[localDb] saveAutofillProfile failed:", err);
+  }
+  return next;
 }
