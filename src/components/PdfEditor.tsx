@@ -139,6 +139,44 @@ export function PdfEditor({
   const viewerRef = useRef<Viewer | null>(null);
   const [viewerInstance, setViewerInstance] = useState<Viewer | null>(null);
   const [formFields, setFormFields] = useState<readonly FormField[]>([]);
+  const [modalBlob, setModalBlob] = useState<Blob | null>(null);
+  const createdAtRef = useRef<number>(Date.now());
+  const formAutoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const manualSaveRef = useRef<(() => Promise<boolean>) | null>(null);
+  const viewerCleanupsRef = useRef<Array<() => void>>([]);
+
+  useEffect(() => {
+    if (!initialDocId) return;
+    getLocalDocument(initialDocId).then((existing) => {
+      if (existing?.createdAt) {
+        createdAtRef.current = existing.createdAt;
+      }
+    });
+  }, [initialDocId]);
+
+  useEffect(() => {
+    return () => {
+      if (formAutoSaveTimerRef.current) {
+        clearTimeout(formAutoSaveTimerRef.current);
+      }
+      viewerCleanupsRef.current.forEach((fn) => {
+        try {
+          fn();
+        } catch {}
+      });
+      viewerCleanupsRef.current = [];
+    };
+  }, []);
+
+  const scheduleLiveBackgroundSave = useCallback(() => {
+    if (formAutoSaveTimerRef.current) {
+      clearTimeout(formAutoSaveTimerRef.current);
+    }
+    formAutoSaveTimerRef.current = setTimeout(() => {
+      formAutoSaveTimerRef.current = null;
+      manualSaveRef.current?.();
+    }, 2000);
+  }, []);
 
   const syncFormFieldsFromViewer = useCallback((v?: Viewer | null) => {
     const target = v || viewerRef.current;
@@ -157,6 +195,13 @@ export function PdfEditor({
 
   const handleViewerReady = useCallback(
     (viewer: Viewer) => {
+      viewerCleanupsRef.current.forEach((fn) => {
+        try {
+          fn();
+        } catch {}
+      });
+      viewerCleanupsRef.current = [];
+
       viewerRef.current = viewer;
       setViewerInstance(viewer);
 
@@ -164,18 +209,56 @@ export function PdfEditor({
       refresh();
 
       try {
-        viewer.documents.onOpened(refresh);
+        const unsubOpened = viewer.documents.onOpened(() => {
+          refresh();
+          const stage = viewer.tryGet("stage");
+          if (stage) {
+            const idx = stage.getCurrentPageIndex();
+            if (typeof idx === "number" && idx >= 0) {
+              setCurrentPageIndex(idx);
+            }
+          }
+        });
+        viewerCleanupsRef.current.push(unsubOpened);
       } catch {}
 
       try {
-        viewer.watch(
+        const unsubForm = viewer.watch(
           () => viewer.tryGet("form")?.getSnapshot() ?? null,
-          () => refresh(),
+          (_snapshot, previous) => {
+            refresh();
+            if (previous !== undefined && previous !== null) {
+              scheduleLiveBackgroundSave();
+            }
+          },
           { immediate: true }
         );
+        viewerCleanupsRef.current.push(unsubForm);
+      } catch {}
+
+      try {
+        const unsubStage = viewer.watch(
+          () => viewer.tryGet("stage")?.getCurrentPageIndex() ?? null,
+          (pageIdx) => {
+            if (typeof pageIdx === "number" && pageIdx >= 0) {
+              setCurrentPageIndex(pageIdx);
+            }
+          },
+          { immediate: true }
+        );
+        viewerCleanupsRef.current.push(unsubStage);
+      } catch {}
+
+      try {
+        const unsubUnsaved = viewer.documents.onUnsavedChangesChanged((ev) => {
+          if (ev?.hasUnsavedChanges) {
+            scheduleLiveBackgroundSave();
+          }
+        });
+        viewerCleanupsRef.current.push(unsubUnsaved);
       } catch {}
     },
-    [syncFormFieldsFromViewer]
+    [syncFormFieldsFromViewer, scheduleLiveBackgroundSave]
   );
 
   // Memoized viewer layout: close all internal tabs & side panels on initial open
@@ -244,17 +327,67 @@ export function PdfEditor({
     };
   }, [leftRailOpen, currentBlob]);
 
-  // Auto-Save Hook integration
+  // Pull live modified bytes (including filled AcroForms & in-viewer annotations) from PDFium
+  const getEffectivePdfBlob = useCallback(async (): Promise<Blob> => {
+    if (viewerRef.current) {
+      try {
+        const bytes = await viewerRef.current.documents.download();
+        if (bytes && bytes.byteLength > 0) {
+          return new Blob([new Uint8Array(bytes)], { type: "application/pdf" });
+        }
+      } catch {
+        // Fallback to currentBlob if active doc isn't ready
+      }
+    }
+    return currentBlob;
+  }, [currentBlob]);
+
+  // Persist live viewer bytes (filled AcroForms + annotations) to IndexedDB
+  const syncLiveViewerToLocalDb = useCallback(
+    async (updateStateBlob = false): Promise<Blob> => {
+      const liveBlob = await getEffectivePdfBlob();
+      const now = Date.now();
+      const docRecord: LocalDocument = {
+        id: docId,
+        title,
+        blob: liveBlob,
+        pageCount: docInfo?.pageCount || 1,
+        sizeBytes: liveBlob.size,
+        updatedAt: now,
+        createdAt: createdAtRef.current,
+        cloudDocId,
+      };
+      await saveLocalDocument(docRecord);
+      if (onDocumentCreatedOrUpdated) {
+        onDocumentCreatedOrUpdated(docRecord);
+      }
+      if (updateStateBlob) {
+        setCurrentBlob(liveBlob);
+      }
+      return liveBlob;
+    },
+    [
+      getEffectivePdfBlob,
+      docId,
+      title,
+      docInfo?.pageCount,
+      cloudDocId,
+      onDocumentCreatedOrUpdated,
+    ]
+  );
+
+  // Auto-Save Hook integration (always pulls live bytes from PDFium)
   const { saveStatus, lastSavedAt, manualSave } = useAutoSave({
     docId,
     title,
-    getBlob: () => currentBlob,
+    getBlob: getEffectivePdfBlob,
     pageCount: docInfo?.pageCount || 1,
     sizeBytes: currentBlob.size,
     cloudDocId,
     debounceMs: 2500,
     periodicIntervalMs: 30000,
   });
+  manualSaveRef.current = manualSave;
 
   // Handle PDF update from surgery, signatures, or stamps
   const handlePdfUpdated = async (newBlob: Blob, description?: string) => {
@@ -275,7 +408,7 @@ export function PdfEditor({
       pageCount: docInfo?.pageCount || 1,
       sizeBytes: newBlob.size,
       updatedAt: now,
-      createdAt: now,
+      createdAt: createdAtRef.current,
       cloudDocId,
     };
     await saveLocalDocument(docRecord);
@@ -286,6 +419,40 @@ export function PdfEditor({
     if (description) {
       showToast(description, "success");
     }
+  };
+
+  // Safe Workspace Exit: flush live form values & annotations to IndexedDB first
+  const handleBackToWorkspace = async () => {
+    if (formAutoSaveTimerRef.current) {
+      clearTimeout(formAutoSaveTimerRef.current);
+      formAutoSaveTimerRef.current = null;
+    }
+    try {
+      await syncLiveViewerToLocalDb(false);
+    } catch (err) {
+      console.warn("[PdfEditor] Sync before exit failed:", err);
+    } finally {
+      onBackToHub();
+    }
+  };
+
+  const handleGoToPage = (pageIdx: number) => {
+    setCurrentPageIndex(pageIdx);
+    try {
+      viewerRef.current?.tryGet("stage")?.goToPage(pageIdx);
+    } catch {}
+  };
+
+  const handleOpenOrganizer = async () => {
+    const liveBlob = await syncLiveViewerToLocalDb(false);
+    setModalBlob(liveBlob);
+    setIsOrganizerOpen(true);
+  };
+
+  const handleOpenSignature = async () => {
+    const liveBlob = await syncLiveViewerToLocalDb(false);
+    setModalBlob(liveBlob);
+    setIsSignatureOpen(true);
   };
 
   // Undo / Redo Actions
@@ -307,19 +474,23 @@ export function PdfEditor({
     }
   };
 
-  // Rotate Current Page 90°
-  const handleQuickRotateCurrentPage = async (degrees: 90 | -90) => {
+  // Rotate Current Page 90° (preserves live filled form values)
+  const handleQuickRotateCurrentPage = async (
+    degrees: 90 | -90,
+    targetPageIdx = currentPageIndex
+  ) => {
     try {
-      const buffer = await blobToArrayBuffer(currentBlob);
-      const outBuffer = await pdfWorker.rotatePages(buffer, [currentPageIndex], degrees);
+      const liveBlob = await getEffectivePdfBlob();
+      const buffer = await blobToArrayBuffer(liveBlob);
+      const outBuffer = await pdfWorker.rotatePages(buffer, [targetPageIdx], degrees);
       const newBlob = arrayBufferToBlob(outBuffer);
-      await handlePdfUpdated(newBlob, `Rotated Page ${currentPageIndex + 1} by ${degrees}°`);
+      await handlePdfUpdated(newBlob, `Rotated Page ${targetPageIdx + 1} by ${degrees}°`);
     } catch (err: any) {
       showToast(`Rotate failed: ${err.message}`, "error");
     }
   };
 
-  // Delete Current Page Execution
+  // Delete Current Page Execution (preserves live filled form values on remaining pages)
   const executeDeleteCurrentPage = async () => {
     setConfirmDeletePage(false);
     if (!docInfo || docInfo.pageCount <= 1) {
@@ -328,7 +499,8 @@ export function PdfEditor({
     }
 
     try {
-      const buffer = await blobToArrayBuffer(currentBlob);
+      const liveBlob = await getEffectivePdfBlob();
+      const buffer = await blobToArrayBuffer(liveBlob);
       const outBuffer = await pdfWorker.deletePages(buffer, [currentPageIndex]);
       const newBlob = arrayBufferToBlob(outBuffer);
       if (currentPageIndex >= docInfo.pageCount - 1) {
@@ -340,11 +512,12 @@ export function PdfEditor({
     }
   };
 
-  // Burn Watermark via Worker
+  // Burn Watermark via Worker (preserves live filled form values)
   const handleApplyWatermark = async () => {
     if (!watermarkText.trim()) return;
     try {
-      const buffer = await blobToArrayBuffer(currentBlob);
+      const liveBlob = await getEffectivePdfBlob();
+      const buffer = await blobToArrayBuffer(liveBlob);
       const ann = {
         id: `wm_${Date.now()}`,
         type: "watermark" as const,
@@ -363,10 +536,11 @@ export function PdfEditor({
     }
   };
 
-  // Burn Redaction Box via Worker
+  // Burn Redaction Box via Worker (preserves live filled form values)
   const handleApplyRedactionBox = async () => {
     try {
-      const buffer = await blobToArrayBuffer(currentBlob);
+      const liveBlob = await getEffectivePdfBlob();
+      const buffer = await blobToArrayBuffer(liveBlob);
       const ann = {
         id: `redact_${Date.now()}`,
         type: "redaction" as const,
@@ -385,21 +559,6 @@ export function PdfEditor({
       showToast(`Redaction failed: ${err.message}`, "error");
     }
   };
-
-  // Pull live modified bytes (including filled AcroForms & in-viewer annotations) from PDFium
-  const getEffectivePdfBlob = useCallback(async (): Promise<Blob> => {
-    if (viewerRef.current) {
-      try {
-        const bytes = await viewerRef.current.documents.download();
-        if (bytes && bytes.byteLength > 0) {
-          return new Blob([bytes.buffer as ArrayBuffer], { type: "application/pdf" });
-        }
-      } catch {
-        // Fallback to currentBlob if active doc isn't ready
-      }
-    }
-    return currentBlob;
-  }, [currentBlob]);
 
   // Flatten interactive AcroForm fields Execution
   const executeFlattenDocument = async () => {
@@ -567,7 +726,7 @@ export function PdfEditor({
         <div className="flex items-center gap-3">
           <button
             type="button"
-            onClick={onBackToHub}
+            onClick={handleBackToWorkspace}
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl border border-white/10 bg-white/[0.04] text-xs font-medium text-zinc-300 hover:text-white hover:bg-white/10 transition-[transform,background-color] duration-150 cursor-pointer active:scale-[0.98]"
           >
             <ArrowLeft className="w-3.5 h-3.5" />
@@ -679,7 +838,7 @@ export function PdfEditor({
 
           <button
             type="button"
-            onClick={() => setIsSignatureOpen(true)}
+            onClick={handleOpenSignature}
             className="flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.03] transition-[transform,background-color] duration-150 cursor-pointer active:scale-[0.98]"
           >
             <PenTool className="w-3.5 h-3.5 text-zinc-300" />
@@ -688,7 +847,7 @@ export function PdfEditor({
 
           <button
             type="button"
-            onClick={() => setIsOrganizerOpen(true)}
+            onClick={handleOpenOrganizer}
             className="flex items-center gap-1 px-3 py-1 rounded-full text-xs font-medium text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.03] transition-[transform,background-color] duration-150 cursor-pointer active:scale-[0.98]"
           >
             <Layers className="w-3.5 h-3.5 text-zinc-300" />
@@ -801,7 +960,7 @@ export function PdfEditor({
       <header className="flex md:hidden items-center justify-between px-3 py-2 border-b border-white/[0.08] bg-[#0c0d12] z-30 shrink-0">
         <button
           type="button"
-          onClick={onBackToHub}
+          onClick={handleBackToWorkspace}
           className="p-1.5 rounded-lg text-zinc-400 hover:text-white transition-colors"
         >
           <ArrowLeft className="w-4 h-4" />
@@ -817,7 +976,7 @@ export function PdfEditor({
         <div className="flex items-center gap-1">
           <button
             type="button"
-            onClick={() => setIsOrganizerOpen(true)}
+            onClick={handleOpenOrganizer}
             className="p-1.5 rounded-lg border border-white/10 text-zinc-300"
             title="Pages"
           >
@@ -860,7 +1019,7 @@ export function PdfEditor({
               {/* Full Organizer Trigger Button */}
               <button
                 type="button"
-                onClick={() => setIsOrganizerOpen(true)}
+                onClick={handleOpenOrganizer}
                 className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-xl border border-dashed border-white/20 bg-white/[0.02] text-xs font-medium text-zinc-300 hover:border-white/40 hover:bg-white/[0.04] hover:text-white transition-all cursor-pointer"
               >
                 <Layers className="w-3.5 h-3.5 text-zinc-300" />
@@ -874,7 +1033,7 @@ export function PdfEditor({
                   return (
                     <div
                       key={idx}
-                      onClick={() => setCurrentPageIndex(idx)}
+                      onClick={() => handleGoToPage(idx)}
                       className={`group relative flex items-center justify-between p-2 rounded-xl border transition-all cursor-pointer ${
                         isCurrent
                           ? "border-white/30 bg-white/[0.08] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.12)] ring-1 ring-white/20"
@@ -913,7 +1072,7 @@ export function PdfEditor({
                           onClick={(e) => {
                             e.stopPropagation();
                             setCurrentPageIndex(idx);
-                            handleQuickRotateCurrentPage(90);
+                            handleQuickRotateCurrentPage(90, idx);
                           }}
                           className="p-1 rounded text-zinc-400 hover:text-white hover:bg-white/10 cursor-pointer"
                           title="Rotate 90° CW"
@@ -1076,11 +1235,13 @@ export function PdfEditor({
           onClose={() => setIsFormPanelOpen(false)}
           viewer={viewerInstance}
           pdfBlob={currentBlob}
+          documentTitle={title}
+          totalPages={docInfo?.pageCount || 1}
           currentPageIndex={currentPageIndex}
           fields={formFields}
           onFieldsChanged={() => syncFormFieldsFromViewer()}
           onFlattenRequest={() => setConfirmFlatten(true)}
-          onOpenSignature={() => setIsSignatureOpen(true)}
+          onOpenSignature={handleOpenSignature}
           onNotify={showToast}
         />
       </div>
@@ -1122,16 +1283,16 @@ export function PdfEditor({
 
           <button
             type="button"
-            onClick={() => setIsSignatureOpen(true)}
+            onClick={handleOpenSignature}
             className="p-2 rounded-full text-zinc-400 hover:text-white cursor-pointer"
             title="E-Sign"
           >
-            <PenTool className="w-4 h-4 text-blue-400" />
+            <PenTool className="w-4 h-4 text-zinc-300" />
           </button>
 
           <button
             type="button"
-            onClick={() => setIsOrganizerOpen(true)}
+            onClick={handleOpenOrganizer}
             className="p-2 rounded-full text-zinc-400 hover:text-white cursor-pointer"
             title="Pages"
           >
@@ -1165,15 +1326,21 @@ export function PdfEditor({
       {/* ========================================================= */}
       <PageOrganizerModal
         isOpen={isOrganizerOpen}
-        onClose={() => setIsOrganizerOpen(false)}
-        pdfBlob={currentBlob}
+        onClose={() => {
+          setIsOrganizerOpen(false);
+          setModalBlob(null);
+        }}
+        pdfBlob={modalBlob || currentBlob}
         onPdfUpdated={handlePdfUpdated}
       />
 
       <SignatureModal
         isOpen={isSignatureOpen}
-        onClose={() => setIsSignatureOpen(false)}
-        pdfBlob={currentBlob}
+        onClose={() => {
+          setIsSignatureOpen(false);
+          setModalBlob(null);
+        }}
+        pdfBlob={modalBlob || currentBlob}
         currentPageIndex={currentPageIndex}
         totalPages={docInfo?.pageCount || 1}
         onPdfUpdated={handlePdfUpdated}

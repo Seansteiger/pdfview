@@ -91,3 +91,33 @@ export function matchProfileValueForField(
 
   return null;
 }
+
+export interface QuickInsertChip {
+  id: string;
+  label: string;
+  value: string;
+}
+
+/**
+ * Builds contextual 1-tap quick-insert chips for a focused text input:
+ * Today's ISO date, checkmark, N/A, plus populated profile fields.
+ */
+export function getQuickInsertChips(profile: AutofillProfile): QuickInsertChip[] {
+  const today = new Date().toISOString().slice(0, 10);
+  const chips: QuickInsertChip[] = [
+    { id: "today", label: "Today", value: today },
+    { id: "check", label: "✓", value: "✓" },
+    { id: "na", label: "N/A", value: "N/A" },
+  ];
+
+  const fullName =
+    profile.fullName.trim() ||
+    [profile.firstName.trim(), profile.lastName.trim()].filter(Boolean).join(" ");
+
+  if (fullName) chips.push({ id: "fullName", label: "Name", value: fullName });
+  if (profile.email.trim()) chips.push({ id: "email", label: "Email", value: profile.email.trim() });
+  if (profile.phone.trim()) chips.push({ id: "phone", label: "Phone", value: profile.phone.trim() });
+  if (profile.company.trim()) chips.push({ id: "company", label: "Company", value: profile.company.trim() });
+
+  return chips;
+}

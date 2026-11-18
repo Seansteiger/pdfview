@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useRef, useMemo } from "react";
+import React, { useState, useEffect, useRef, useMemo, useCallback } from "react";
 import {
   X,
   ClipboardList,
@@ -17,23 +17,39 @@ import {
   Type,
   ChevronRight,
   Trash2,
+  Search,
+  ArrowRight,
+  Download,
+  Upload,
+  AlignLeft,
+  ChevronDown,
 } from "lucide-react";
 import type { Viewer } from "@embedpdf/viewer/core";
-import type { FormField, FormFieldValue } from "@embedpdf/plugin-form";
+import type { FormField, FormFieldValue, FormPlainValue } from "@embedpdf/plugin-form";
 import {
   AutofillProfile,
   EMPTY_AUTOFILL_PROFILE,
   getAutofillProfile,
   saveAutofillProfile,
 } from "@/lib/localDb";
-import { formatFieldLabel, matchProfileValueForField } from "@/lib/formAutofill";
-import { detectFormFieldsOnPage } from "@/lib/formDetector";
+import {
+  formatFieldLabel,
+  getQuickInsertChips,
+  matchProfileValueForField,
+} from "@/lib/formAutofill";
+import {
+  detectFormFieldsOnPage,
+  detectFormFieldsAllPages,
+  type DetectedFieldDraft,
+} from "@/lib/formDetector";
 
 export interface FormFillerPanelProps {
   isOpen: boolean;
   onClose: () => void;
   viewer: Viewer | null;
   pdfBlob: Blob | null;
+  documentTitle?: string;
+  totalPages?: number;
   currentPageIndex: number;
   fields: readonly FormField[];
   onFieldsChanged: () => void;
@@ -43,12 +59,56 @@ export interface FormFillerPanelProps {
 }
 
 type PanelTab = "fill" | "build" | "profile";
+type FieldFilterMode = "all" | "empty" | "required";
+
+interface RectBox {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+function rectsOverlap(a: RectBox, b: RectBox): boolean {
+  const aCx = a.x + a.width / 2;
+  const aCy = a.y + a.height / 2;
+  const bCx = b.x + b.width / 2;
+  const bCy = b.y + b.height / 2;
+
+  const aCenterInB =
+    aCx >= b.x - 2 &&
+    aCx <= b.x + b.width + 2 &&
+    aCy >= b.y - 2 &&
+    aCy <= b.y + b.height + 2;
+  if (aCenterInB) return true;
+
+  const bCenterInA =
+    bCx >= a.x - 2 &&
+    bCx <= a.x + a.width + 2 &&
+    bCy >= a.y - 2 &&
+    bCy <= a.y + a.height + 2;
+  if (bCenterInA) return true;
+
+  const interX = Math.max(0, Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x));
+  const interY = Math.max(0, Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y));
+  const interArea = interX * interY;
+  const minArea = Math.max(1, Math.min(a.width * a.height, b.width * b.height));
+  return interArea / minArea > 0.4;
+}
+
+function extractTextValue(field: FormField): string {
+  if (field.kind === "text" || field.kind === "combobox") {
+    return field.value;
+  }
+  return "";
+}
 
 export function FormFillerPanel({
   isOpen,
   onClose,
   viewer,
   pdfBlob,
+  documentTitle = "document",
+  totalPages = 1,
   currentPageIndex,
   fields,
   onFieldsChanged,
@@ -59,16 +119,46 @@ export function FormFillerPanel({
   const [activeTab, setActiveTab] = useState<PanelTab>("fill");
   const [profile, setProfile] = useState<AutofillProfile>(EMPTY_AUTOFILL_PROFILE);
   const [profileSaved, setProfileSaved] = useState(false);
-  const [isDetecting, setIsDetecting] = useState(false);
+  const [isDetecting, setIsDetecting] = useState<"page" | "all" | null>(null);
   const [missingNames, setMissingNames] = useState<Set<string>>(new Set());
   const [customFieldLabel, setCustomFieldLabel] = useState("");
+
+  // Target page selector for Add Fields tab (follows active page automatically)
+  const [targetPageIndex, setTargetPageIndex] = useState<number>(currentPageIndex);
+  const [showDropdownBuilder, setShowDropdownBuilder] = useState(false);
+  const [dropdownOptionsText, setDropdownOptionsText] = useState("Option 1, Option 2, Option 3");
+
+  // Search & filter in Fill tab
+  const [searchQuery, setSearchQuery] = useState("");
+  const [filterMode, setFilterMode] = useState<FieldFilterMode>("all");
+
+  // Controlled-input draft buffer & debounce refs (eliminates cursor jump & async race)
+  const [localTextValues, setLocalTextValues] = useState<Record<string, string>>({});
+  const [focusedFieldName, setFocusedFieldName] = useState<string | null>(null);
+  const focusedFieldNameRef = useRef<string | null>(null);
+  const debounceTimersRef = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const pendingValuesRef = useRef<Record<string, string>>({});
+
   const inputRefs = useRef<Record<string, HTMLElement | null>>({});
+  const cardRefs = useRef<Record<string, HTMLDivElement | null>>({});
+  const jsonFileInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    setTargetPageIndex(currentPageIndex);
+  }, [currentPageIndex]);
+
+  // Clear pending debounce timers on unmount
+  useEffect(() => {
+    const timers = debounceTimersRef.current;
+    return () => {
+      Object.values(timers).forEach(clearTimeout);
+    };
+  }, []);
 
   // Load Autofill Profile when panel opens
   useEffect(() => {
     if (isOpen) {
       getAutofillProfile().then(setProfile);
-      // If document has zero AcroForm fields, default user to the Make Fillable tab helper hint or stay on fill with clear CTA
       if (fields.length === 0) {
         setActiveTab("build");
       } else {
@@ -82,31 +172,126 @@ export function FormFillerPanel({
     [fields]
   );
 
-  const filledCount = useMemo(() => {
-    return fillableFields.filter((f) => {
-      if (f.kind === "text") return f.value.trim().length > 0;
-      if (f.kind === "checkbox") return f.checked;
-      if (f.kind === "radio") return f.value && f.value !== "Off";
-      if (f.kind === "combobox") return f.value.trim().length > 0;
-      if (f.kind === "listbox") return f.selectedValues.length > 0;
-      return false;
-    }).length;
+  // Sync local text drafts from PDFium snapshot for non-focused, non-pending fields
+  useEffect(() => {
+    setLocalTextValues((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const field of fillableFields) {
+        if (field.kind !== "text" && field.kind !== "combobox") continue;
+        if (field.name === focusedFieldNameRef.current) continue;
+        if (pendingValuesRef.current[field.name] !== undefined) continue;
+        if (next[field.name] !== field.value) {
+          next[field.name] = field.value;
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
   }, [fillableFields]);
 
-  const progressPct =
-    fillableFields.length > 0
-      ? Math.round((filledCount / fillableFields.length) * 100)
-      : 0;
-
-  if (!isOpen) return null;
-
-  const getForm = () => {
+  const getForm = useCallback(() => {
     if (!viewer) return null;
     try {
       return viewer.tryGet("form");
     } catch {
       return null;
     }
+  }, [viewer]);
+
+  const pageCount = useMemo(() => {
+    const viewerPages = viewer?.documents?.listPages()?.length ?? 0;
+    return Math.max(1, totalPages, viewerPages);
+  }, [viewer, totalPages]);
+
+  // Map each field name -> 0-based page index
+  const fieldPageIndexMap = useMemo(() => {
+    const map: Record<string, number> = {};
+    if (!viewer) return map;
+    const form = getForm();
+    for (const field of fillableFields) {
+      let pageRef = field.widgets?.[0]?.page ?? null;
+      if (!pageRef && form) {
+        try {
+          pageRef = form.getWidgets(field.ref)?.[0]?.page ?? null;
+        } catch {
+          pageRef = null;
+        }
+      }
+      if (pageRef) {
+        try {
+          const idx = viewer.documents.getPageIndex(pageRef);
+          if (idx >= 0) map[field.name] = idx;
+        } catch {
+          // Ignore unplaced widgets
+        }
+      }
+    }
+    return map;
+  }, [viewer, fillableFields, getForm]);
+
+  const isFieldEmpty = useCallback(
+    (field: FormField): boolean => {
+      if (field.kind === "text") {
+        const val = localTextValues[field.name] ?? field.value;
+        return val.trim().length === 0;
+      }
+      if (field.kind === "checkbox") return !field.checked;
+      if (field.kind === "radio") return !field.value || field.value === "Off";
+      if (field.kind === "combobox") {
+        const val = localTextValues[field.name] ?? field.value;
+        return val.trim().length === 0;
+      }
+      if (field.kind === "listbox") return field.selectedValues.length === 0;
+      return false;
+    },
+    [localTextValues]
+  );
+
+  const filledCount = useMemo(() => {
+    return fillableFields.filter((f) => {
+      if (f.kind === "signature") return false;
+      return !isFieldEmpty(f);
+    }).length;
+  }, [fillableFields, isFieldEmpty]);
+
+  const progressPct =
+    fillableFields.length > 0
+      ? Math.round((filledCount / fillableFields.length) * 100)
+      : 0;
+
+  const filteredFields = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    return fillableFields.filter((field) => {
+      if (filterMode === "empty" && !isFieldEmpty(field)) return false;
+      if (filterMode === "required" && !field.required) return false;
+      if (!q) return true;
+      const label = formatFieldLabel(field.name, field.alternateName).toLowerCase();
+      return label.includes(q) || field.name.toLowerCase().includes(q);
+    });
+  }, [fillableFields, filterMode, searchQuery, isFieldEmpty]);
+
+  const quickChips = useMemo(() => getQuickInsertChips(profile), [profile]);
+
+  if (!isOpen) return null;
+
+  const clearAllPendingTextWrites = () => {
+    Object.values(debounceTimersRef.current).forEach(clearTimeout);
+    debounceTimersRef.current = {};
+    pendingValuesRef.current = {};
+  };
+
+  const forceSyncLocalFromForm = () => {
+    const form = getForm();
+    if (!form) return;
+    const latest = form.list();
+    const updated: Record<string, string> = {};
+    for (const f of latest) {
+      if (f.kind === "text" || f.kind === "combobox") {
+        updated[f.name] = extractTextValue(f);
+      }
+    }
+    setLocalTextValues(updated);
   };
 
   const handleSetFieldValue = async (field: FormField, value: FormFieldValue) => {
@@ -127,6 +312,55 @@ export function FormFillerPanel({
     }
   };
 
+  const commitTextValue = async (field: FormField, value: string) => {
+    if (debounceTimersRef.current[field.name]) {
+      clearTimeout(debounceTimersRef.current[field.name]);
+      delete debounceTimersRef.current[field.name];
+    }
+    delete pendingValuesRef.current[field.name];
+    await handleSetFieldValue(field, { value });
+  };
+
+  const handleTextDraftChange = (field: FormField, nextVal: string) => {
+    setLocalTextValues((prev) => ({ ...prev, [field.name]: nextVal }));
+    pendingValuesRef.current[field.name] = nextVal;
+
+    if (debounceTimersRef.current[field.name]) {
+      clearTimeout(debounceTimersRef.current[field.name]);
+    }
+    debounceTimersRef.current[field.name] = setTimeout(() => {
+      delete debounceTimersRef.current[field.name];
+      const latestPending = pendingValuesRef.current[field.name];
+      if (latestPending !== undefined) {
+        commitTextValue(field, latestPending);
+      }
+    }, 120);
+  };
+
+  const flushTextField = async (field: FormField) => {
+    const hasTimer = Boolean(debounceTimersRef.current[field.name]);
+    const pending = pendingValuesRef.current[field.name];
+    if (hasTimer || pending !== undefined) {
+      const valueToCommit = pending ?? localTextValues[field.name] ?? extractTextValue(field);
+      await commitTextValue(field, valueToCommit);
+    }
+  };
+
+  const flushAllPendingTextFields = async () => {
+    const pendingNames = Object.keys(pendingValuesRef.current);
+    for (const name of pendingNames) {
+      const target = fillableFields.find((f) => f.name === name);
+      if (target) {
+        await flushTextField(target);
+      }
+    }
+  };
+
+  const handleApplyQuickChip = async (field: FormField, chipValue: string) => {
+    setLocalTextValues((prev) => ({ ...prev, [field.name]: chipValue }));
+    await commitTextValue(field, chipValue);
+  };
+
   const handleFocusField = (field: FormField) => {
     const form = getForm();
     if (!form) return;
@@ -137,20 +371,73 @@ export function FormFillerPanel({
     }
   };
 
-  const handleAdvanceNext = (idx: number) => {
-    const nextField = fillableFields[idx + 1];
+  const handleInputFocus = (field: FormField) => {
+    focusedFieldNameRef.current = field.name;
+    setFocusedFieldName(field.name);
+    handleFocusField(field);
+  };
+
+  const handleInputBlur = (field: FormField) => {
+    if (focusedFieldNameRef.current === field.name) {
+      focusedFieldNameRef.current = null;
+      setFocusedFieldName(null);
+    }
+    flushTextField(field);
+  };
+
+  const focusFieldEverywhere = (target: FormField) => {
+    handleFocusField(target);
+    const card = cardRefs.current[target.name];
+    if (card) {
+      card.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+    const el = inputRefs.current[target.name];
+    if (el && typeof el.focus === "function") {
+      el.focus();
+    }
+  };
+
+  const handleAdvanceNext = async (currentField: FormField) => {
+    await flushTextField(currentField);
+    const idxInFiltered = filteredFields.findIndex((f) => f.name === currentField.name);
+    const nextField = filteredFields[idxInFiltered + 1];
     if (nextField) {
-      handleFocusField(nextField);
-      const el = inputRefs.current[nextField.name];
-      if (el && typeof el.focus === "function") {
-        el.focus();
-      }
+      focusFieldEverywhere(nextField);
+    }
+  };
+
+  const handleJumpNextEmpty = () => {
+    const emptyList = fillableFields.filter((f) => f.kind !== "signature" && isFieldEmpty(f));
+    if (emptyList.length === 0) {
+      onNotify("All fillable fields are already completed.", "success");
+      return;
+    }
+
+    const currentIdx = focusedFieldName
+      ? fillableFields.findIndex((f) => f.name === focusedFieldName)
+      : -1;
+
+    const afterCurrent = fillableFields
+      .slice(currentIdx + 1)
+      .find((f) => f.kind !== "signature" && isFieldEmpty(f));
+    const nextEmpty = afterCurrent || emptyList[0];
+
+    // If current search/filter hides the next empty field, clear filters so the user sees it
+    const visibleInList = filteredFields.some((f) => f.name === nextEmpty.name);
+    if (!visibleInList) {
+      setSearchQuery("");
+      setFilterMode("all");
+      requestAnimationFrame(() => focusFieldEverywhere(nextEmpty));
+    } else {
+      focusFieldEverywhere(nextEmpty);
     }
   };
 
   const handleSmartAutofill = async () => {
     const form = getForm();
     if (!form) return;
+
+    clearAllPendingTextWrites();
 
     const entries: { ref: FormField["ref"]; value: FormFieldValue }[] = [];
     for (const field of fillableFields) {
@@ -182,6 +469,7 @@ export function FormFillerPanel({
 
     try {
       await form.setValues(entries);
+      forceSyncLocalFromForm();
       onFieldsChanged();
       onNotify(`Autofilled ${entries.length} field${entries.length === 1 ? "" : "s"}`, "success");
     } catch (err: any) {
@@ -189,9 +477,10 @@ export function FormFillerPanel({
     }
   };
 
-  const handleValidate = () => {
+  const handleValidate = async () => {
     const form = getForm();
     if (!form) return;
+    await flushAllPendingTextFields();
     const result = form.validate();
     if (result.valid) {
       setMissingNames(new Set());
@@ -200,7 +489,7 @@ export function FormFillerPanel({
       const names = new Set(result.missing.map((m) => m.name));
       setMissingNames(names);
       if (result.missing[0]) {
-        handleFocusField(result.missing[0]);
+        focusFieldEverywhere(result.missing[0]);
       }
       onNotify(
         `${result.missing.length} required field${result.missing.length === 1 ? " is" : "s are"} empty.`,
@@ -213,8 +502,10 @@ export function FormFillerPanel({
     const form = getForm();
     if (!form) return;
     try {
+      clearAllPendingTextWrites();
       await form.reset();
       setMissingNames(new Set());
+      forceSyncLocalFromForm();
       onFieldsChanged();
       onNotify("Form fields reset to default values.", "info");
     } catch (err: any) {
@@ -222,105 +513,273 @@ export function FormFillerPanel({
     }
   };
 
+  const handleExportJson = async () => {
+    const form = getForm();
+    if (!form) return;
+    try {
+      await flushAllPendingTextFields();
+      const values = form.exportValues();
+      const count = Object.keys(values).length;
+      if (count === 0) {
+        onNotify("Fill at least one field before exporting form data.", "info");
+        return;
+      }
+      const safeStem = documentTitle
+        .replace(/\.pdf$/i, "")
+        .replace(/[^a-z0-9_-]+/gi, "-")
+        .replace(/^-+|-+$/g, "")
+        .toLowerCase() || "form";
+      const blob = new Blob([JSON.stringify(values, null, 2)], {
+        type: "application/json",
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${safeStem}-form-data.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      onNotify(`Exported ${count} field value${count === 1 ? "" : "s"} to JSON.`, "success");
+    } catch (err: any) {
+      onNotify(`Export JSON failed: ${err?.message || "Unknown error"}`, "error");
+    }
+  };
+
+  const handleImportJsonFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+
+    const form = getForm();
+    if (!form) return;
+
+    try {
+      const text = await file.text();
+      const parsed = JSON.parse(text);
+      const rawValues =
+        parsed && typeof parsed === "object" && !Array.isArray(parsed)
+          ? parsed.values && typeof parsed.values === "object" && !Array.isArray(parsed.values)
+            ? parsed.values
+            : parsed
+          : null;
+
+      if (!rawValues) {
+        onNotify("Invalid form JSON file. Expected a key-value object.", "error");
+        return;
+      }
+
+      clearAllPendingTextWrites();
+      const result = await form.importValues(rawValues as Record<string, FormPlainValue>);
+      forceSyncLocalFromForm();
+      onFieldsChanged();
+
+      const appliedCount = result.applied?.length ?? 0;
+      const skippedCount = result.skipped?.length ?? 0;
+      onNotify(
+        skippedCount > 0
+          ? `Imported ${appliedCount} field${appliedCount === 1 ? "" : "s"} (${skippedCount} skipped).`
+          : `Imported form data (${appliedCount} field${appliedCount === 1 ? "" : "s"} updated).`,
+        "success"
+      );
+    } catch (err: any) {
+      onNotify(`Import JSON failed: ${err?.message || "Invalid JSON"}`, "error");
+    }
+  };
+
+  const createNonOverlappingDetectedDrafts = async (
+    drafts: DetectedFieldDraft[]
+  ): Promise<{ created: number; skippedOverlaps: number; pageSet: Set<number> }> => {
+    const form = getForm();
+    if (!form || !viewer) {
+      return { created: 0, skippedOverlaps: 0, pageSet: new Set() };
+    }
+
+    const pages = viewer.documents.listPages();
+    const existingNames = new Set(fields.map((f) => f.name));
+    const occupiedByPage = new Map<number, RectBox[]>();
+
+    const getOccupiedForPage = (pageIdx: number): RectBox[] => {
+      if (occupiedByPage.has(pageIdx)) return occupiedByPage.get(pageIdx)!;
+      const pageInfo = pages[pageIdx];
+      if (!pageInfo) {
+        occupiedByPage.set(pageIdx, []);
+        return [];
+      }
+      try {
+        const boxes = form.listWidgets(pageInfo.ref).map((w) => ({
+          x: w.box.x,
+          y: w.box.y,
+          width: w.box.width,
+          height: w.box.height,
+        }));
+        occupiedByPage.set(pageIdx, boxes);
+        return boxes;
+      } catch {
+        occupiedByPage.set(pageIdx, []);
+        return [];
+      }
+    };
+
+    let created = 0;
+    let skippedOverlaps = 0;
+    const pageSet = new Set<number>();
+
+    for (const draft of drafts) {
+      const targetPage = pages[draft.pageIndex];
+      if (!targetPage) continue;
+
+      const occupied = getOccupiedForPage(draft.pageIndex);
+      if (occupied.some((existingBox) => rectsOverlap(draft.rect, existingBox))) {
+        skippedOverlaps++;
+        continue;
+      }
+
+      let name = draft.name;
+      let suffix = 2;
+      while (existingNames.has(name)) {
+        name = `${draft.name}_${suffix++}`;
+      }
+      existingNames.add(name);
+
+      try {
+        if (draft.kind === "checkbox") {
+          await form.create({
+            kind: "checkbox",
+            name,
+            alternateName: draft.label,
+            widgets: [
+              {
+                page: targetPage.ref,
+                rect: draft.rect,
+                borderStyle: "solid",
+                strokeWidth: 1,
+              },
+            ],
+          });
+        } else {
+          await form.create({
+            kind: "text",
+            name,
+            alternateName: draft.label,
+            widgets: [
+              {
+                page: targetPage.ref,
+                rect: draft.rect,
+                fontSize: 11,
+                borderStyle: "underline",
+                strokeWidth: 1,
+              },
+            ],
+          });
+        }
+        occupied.push(draft.rect);
+        created++;
+        pageSet.add(draft.pageIndex);
+      } catch (createErr) {
+        console.warn("[FormFillerPanel] Skipped detected field:", name, createErr);
+      }
+    }
+
+    return { created, skippedOverlaps, pageSet };
+  };
+
   const handleAutoDetectPageFields = async () => {
     const form = getForm();
     if (!form || !viewer || !pdfBlob) return;
 
     try {
-      setIsDetecting(true);
+      setIsDetecting("page");
       const pages = viewer.documents.listPages();
-      const targetPage = pages[currentPageIndex] || pages[0];
+      const safePageIdx = Math.min(Math.max(0, targetPageIndex), Math.max(0, pages.length - 1));
+      const targetPage = pages[safePageIdx];
       if (!targetPage) {
         onNotify("No active page found.", "error");
         return;
       }
 
-      const detected = await detectFormFieldsOnPage(pdfBlob, currentPageIndex);
+      const detected = await detectFormFieldsOnPage(pdfBlob, safePageIdx);
       if (detected.length === 0) {
         onNotify(
-          "No blank lines or checkboxes detected on this page. Use '+ Add Field' below to place one manually.",
+          `No blank lines or checkboxes detected on Page ${safePageIdx + 1}. Use '+ Add Field' below to place one manually.`,
           "info"
         );
         return;
       }
 
-      const existingNames = new Set(fields.map((f) => f.name));
-      let createdCount = 0;
-
-      for (const draft of detected) {
-        let name = draft.name;
-        let suffix = 2;
-        while (existingNames.has(name)) {
-          name = `${draft.name}_${suffix++}`;
-        }
-        existingNames.add(name);
-
-        try {
-          if (draft.kind === "checkbox") {
-            await form.create({
-              kind: "checkbox",
-              name,
-              alternateName: draft.label,
-              widgets: [
-                {
-                  page: targetPage.ref,
-                  rect: draft.rect,
-                  borderStyle: "solid",
-                  strokeWidth: 1,
-                },
-              ],
-            });
-          } else {
-            await form.create({
-              kind: "text",
-              name,
-              alternateName: draft.label,
-              widgets: [
-                {
-                  page: targetPage.ref,
-                  rect: draft.rect,
-                  fontSize: 11,
-                  borderStyle: "underline",
-                  strokeWidth: 1,
-                },
-              ],
-            });
-          }
-          createdCount++;
-        } catch (createErr) {
-          console.warn("[FormFillerPanel] Skipped detected field:", name, createErr);
-        }
-      }
-
+      const { created, skippedOverlaps } = await createNonOverlappingDetectedDrafts(detected);
       onFieldsChanged();
-      if (createdCount > 0) {
+
+      if (created > 0) {
         setActiveTab("fill");
         onNotify(
-          `Detected & created ${createdCount} fillable field${createdCount === 1 ? "" : "s"} on Page ${currentPageIndex + 1}.`,
+          `Detected & created ${created} field${created === 1 ? "" : "s"} on Page ${safePageIdx + 1}.`,
           "success"
         );
+      } else if (skippedOverlaps > 0) {
+        onNotify(`All ${skippedOverlaps} detected zones on Page ${safePageIdx + 1} already have fields.`, "info");
       } else {
         onNotify("Could not place detected fields on this page.", "info");
       }
     } catch (err: any) {
       onNotify(`Detection error: ${err?.message || "Failed"}`, "error");
     } finally {
-      setIsDetecting(false);
+      setIsDetecting(null);
     }
   };
 
-  const handleQuickAddField = async (preset: "text" | "checkbox" | "date") => {
+  const handleAutoDetectAllPages = async () => {
+    const form = getForm();
+    if (!form || !viewer || !pdfBlob) return;
+
+    try {
+      setIsDetecting("all");
+      const detected = await detectFormFieldsAllPages(pdfBlob);
+      if (detected.length === 0) {
+        onNotify("No blank lines or checkboxes detected in this document.", "info");
+        return;
+      }
+
+      const { created, skippedOverlaps, pageSet } =
+        await createNonOverlappingDetectedDrafts(detected);
+      onFieldsChanged();
+
+      if (created > 0) {
+        setActiveTab("fill");
+        onNotify(
+          `Created ${created} field${created === 1 ? "" : "s"} across ${pageSet.size} page${pageSet.size === 1 ? "" : "s"}.`,
+          "success"
+        );
+      } else if (skippedOverlaps > 0) {
+        onNotify("All detected form zones across the document already have interactive fields.", "info");
+      } else {
+        onNotify("Could not place detected fields.", "info");
+      }
+    } catch (err: any) {
+      onNotify(`Full-document scan error: ${err?.message || "Failed"}`, "error");
+    } finally {
+      setIsDetecting(null);
+    }
+  };
+
+  const handleQuickAddField = async (
+    preset: "text" | "checkbox" | "date" | "multiline" | "dropdown"
+  ) => {
     const form = getForm();
     if (!form || !viewer) return;
 
     const pages = viewer.documents.listPages();
-    const targetPage = pages[currentPageIndex] || pages[0];
+    const safePageIdx = Math.min(Math.max(0, targetPageIndex), Math.max(0, pages.length - 1));
+    const targetPage = pages[safePageIdx];
     if (!targetPage) return;
 
     const existingNames = new Set(fields.map((f) => f.name));
-    const baseLabel =
-      customFieldLabel.trim() ||
-      (preset === "checkbox" ? "Checkbox" : preset === "date" ? "Date" : "Text Field");
+    const defaultLabels: Record<typeof preset, string> = {
+      text: "Text Field",
+      checkbox: "Checkbox",
+      date: "Date",
+      multiline: "Notes",
+      dropdown: "Selection",
+    };
+    const baseLabel = customFieldLabel.trim() || defaultLabels[preset];
     const baseSlug =
       baseLabel
         .toLowerCase()
@@ -333,53 +792,94 @@ export function FormFillerPanel({
       name = `${baseSlug}_${n++}`;
     }
 
-    const offsetStep = (fields.length % 8) * 28;
+    const offsetStep = (fields.length % 8) * 30;
     const x = 72;
-    const y = Math.min(targetPage.size.height - 60, 120 + offsetStep);
+    const y = Math.min(targetPage.size.height - 80, 120 + offsetStep);
 
     try {
-      const res =
-        preset === "checkbox"
-          ? await form.create({
-              kind: "checkbox",
-              name,
-              alternateName: baseLabel,
-              widgets: [
-                {
-                  page: targetPage.ref,
-                  rect: { x, y, width: 18, height: 18 },
-                  borderStyle: "solid",
-                  strokeWidth: 1,
-                },
-              ],
-            })
-          : await form.create({
-              kind: "text",
-              name,
-              alternateName: baseLabel,
-              defaultValue: preset === "date" ? new Date().toISOString().slice(0, 10) : "",
-              widgets: [
-                {
-                  page: targetPage.ref,
-                  rect: { x, y, width: preset === "date" ? 130 : 220, height: 22 },
-                  fontSize: 11,
-                  borderStyle: "solid",
-                  strokeWidth: 1,
-                },
-              ],
-            });
-
-      if (preset === "date") {
-        await form.setValue(res.field.ref, {
-          value: new Date().toISOString().slice(0, 10),
+      let res;
+      if (preset === "checkbox") {
+        res = await form.create({
+          kind: "checkbox",
+          name,
+          alternateName: baseLabel,
+          widgets: [
+            {
+              page: targetPage.ref,
+              rect: { x, y, width: 18, height: 18 },
+              borderStyle: "solid",
+              strokeWidth: 1,
+            },
+          ],
         });
+      } else if (preset === "dropdown") {
+        const parsedOptions = dropdownOptionsText
+          .split(",")
+          .map((opt) => opt.trim())
+          .filter(Boolean);
+        const optionsList = (parsedOptions.length > 0 ? parsedOptions : ["Option 1", "Option 2"]).map(
+          (v) => ({ label: v, value: v })
+        );
+        res = await form.create({
+          kind: "combobox",
+          name,
+          alternateName: baseLabel,
+          options: optionsList,
+          widgets: [
+            {
+              page: targetPage.ref,
+              rect: { x, y, width: 200, height: 22 },
+              fontSize: 11,
+              borderStyle: "solid",
+              strokeWidth: 1,
+            },
+          ],
+        });
+      } else if (preset === "multiline") {
+        res = await form.create({
+          kind: "text",
+          name,
+          alternateName: baseLabel,
+          multiline: true,
+          widgets: [
+            {
+              page: targetPage.ref,
+              rect: { x, y, width: 260, height: 64 },
+              fontSize: 11,
+              borderStyle: "solid",
+              strokeWidth: 1,
+            },
+          ],
+        });
+      } else {
+        const today = new Date().toISOString().slice(0, 10);
+        res = await form.create({
+          kind: "text",
+          name,
+          alternateName: baseLabel,
+          defaultValue: preset === "date" ? today : "",
+          widgets: [
+            {
+              page: targetPage.ref,
+              rect: { x, y, width: preset === "date" ? 130 : 220, height: 22 },
+              fontSize: 11,
+              borderStyle: "solid",
+              strokeWidth: 1,
+            },
+          ],
+        });
+
+        if (preset === "date") {
+          await form.setValue(res.field.ref, { value: today });
+        }
       }
 
       setCustomFieldLabel("");
+      setShowDropdownBuilder(false);
       onFieldsChanged();
       setActiveTab("fill");
       form.focus(res.field.ref);
-      onNotify(`Added "${baseLabel}" to Page ${currentPageIndex + 1}`, "success");
+      onNotify(`Added "${baseLabel}" to Page ${safePageIdx + 1}`, "success");
     } catch (err: any) {
       onNotify(`Could not add field: ${err?.message || "Error"}`, "error");
     }
@@ -389,6 +889,11 @@ export function FormFillerPanel({
     const form = getForm();
     if (!form) return;
     try {
+      if (debounceTimersRef.current[field.name]) {
+        clearTimeout(debounceTimersRef.current[field.name]);
+        delete debounceTimersRef.current[field.name];
+      }
+      delete pendingValuesRef.current[field.name];
       await form.delete(field.ref);
       onFieldsChanged();
       onNotify(`Removed "${formatFieldLabel(field.name, field.alternateName)}"`, "info");
@@ -407,7 +912,16 @@ export function FormFillerPanel({
   };
 
   return (
-    <aside className="fixed inset-x-0 bottom-0 top-14 md:static md:w-[360px] md:inset-auto border-l border-white/[0.08] bg-[#0c0d12] flex flex-col z-40 shrink-0 shadow-2xl md:shadow-none">
+    <aside className="fixed inset-x-0 bottom-0 top-14 md:static md:w-[368px] md:inset-auto border-l border-white/[0.08] bg-[#0c0d12] flex flex-col z-40 shrink-0 shadow-2xl md:shadow-none">
+      {/* Hidden JSON File Input for Import */}
+      <input
+        ref={jsonFileInputRef}
+        type="file"
+        accept="application/json,.json"
+        onChange={handleImportJsonFile}
+        className="hidden"
+      />
+
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-white/[0.08] bg-[#09090b]">
         <div className="flex items-center gap-2 min-w-0">
@@ -433,7 +947,7 @@ export function FormFillerPanel({
 
       {/* Segmented Tabs */}
       <div className="px-3 pt-3 pb-2 border-b border-white/[0.06]">
-        <div className="grid grid-cols-3 gap-1 p-1 rounded-xl bg-[#111113] border border-white/[0.07]">
+        <div className="grid grid-cols-3 gap-1 p-1 rounded-[14px] bg-[#111113] border border-white/[0.07]">
           {(
             [
               { id: "fill", label: `Fill (${fillableFields.length})` },
@@ -485,8 +999,8 @@ export function FormFillerPanel({
               </div>
             ) : (
               <>
-                {/* Progress & Quick Actions */}
-                <div className="rounded-[16px] border border-white/[0.08] bg-[#111113] p-3 space-y-2.5">
+                {/* Progress & Quick Actions (Concentric: outer p-3 + inner rounded-lg = rounded-[20px]) */}
+                <div className="rounded-[20px] border border-white/[0.08] bg-[#111113] p-3 space-y-2.5">
                   <div className="flex items-center justify-between text-[11px]">
                     <span className="text-zinc-400">Completion</span>
                     <span className="font-mono tabular-nums text-zinc-200 font-semibold">
@@ -510,8 +1024,17 @@ export function FormFillerPanel({
                     </button>
                     <button
                       type="button"
+                      onClick={handleJumpNextEmpty}
+                      className="flex items-center gap-1 py-1.5 px-2.5 rounded-lg border border-white/10 bg-white/[0.04] text-zinc-200 hover:text-white hover:bg-white/[0.08] transition-[transform,background-color] duration-150 active:scale-[0.98] cursor-pointer"
+                      title="Jump to next empty field"
+                    >
+                      <span>Next Empty</span>
+                      <ArrowRight className="w-3 h-3 translate-x-[0.5px]" />
+                    </button>
+                    <button
+                      type="button"
                       onClick={handleValidate}
-                      className="py-1.5 px-2.5 rounded-lg border border-white/10 bg-white/[0.04] text-zinc-300 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer"
+                      className="py-1.5 px-2 rounded-lg border border-white/10 bg-white/[0.04] text-zinc-300 hover:text-white hover:bg-white/[0.08] transition-colors cursor-pointer"
                       title="Check required fields"
                     >
                       Check
@@ -525,230 +1048,388 @@ export function FormFillerPanel({
                       <RotateCcw className="w-3.5 h-3.5" />
                     </button>
                   </div>
+
+                  {/* Portable Form Data JSON Bar */}
+                  <div className="flex items-center justify-between gap-1.5 pt-1 border-t border-white/[0.06]">
+                    <span className="text-[10px] text-zinc-500 font-medium">
+                      Form Data JSON
+                    </span>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => jsonFileInputRef.current?.click()}
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded-lg border border-white/10 bg-white/[0.03] text-[10px] font-medium text-zinc-300 hover:text-white hover:bg-white/[0.08] transition-[transform,background-color] duration-150 active:scale-[0.98] cursor-pointer"
+                        title="Import field values from JSON"
+                      >
+                        <Upload className="w-3 h-3" />
+                        <span>Import</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleExportJson}
+                        className="inline-flex items-center gap-1 px-2 py-1 rounded-lg border border-white/10 bg-white/[0.03] text-[10px] font-medium text-zinc-300 hover:text-white hover:bg-white/[0.08] transition-[transform,background-color] duration-150 active:scale-[0.98] cursor-pointer"
+                        title="Export field values as JSON"
+                      >
+                        <Download className="w-3 h-3" />
+                        <span>Export</span>
+                      </button>
+                    </div>
+                  </div>
                 </div>
 
+                {/* Search & Filter Bar (for forms with >= 4 fields) */}
+                {fillableFields.length >= 4 && (
+                  <div className="space-y-2">
+                    <div className="relative">
+                      <Search className="w-3.5 h-3.5 text-zinc-500 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                      <input
+                        type="text"
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        placeholder="Filter fields..."
+                        className="w-full pl-8 pr-7 py-1.5 rounded-lg border border-white/10 bg-[#111113] text-xs text-white placeholder:text-zinc-600 focus:outline-none focus:border-white/30"
+                      />
+                      {searchQuery && (
+                        <button
+                          type="button"
+                          onClick={() => setSearchQuery("")}
+                          className="absolute right-2 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-white cursor-pointer"
+                          title="Clear filter"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-1">
+                      {(
+                        [
+                          { id: "all", label: "All" },
+                          { id: "empty", label: "Empty Only" },
+                          { id: "required", label: "Required" },
+                        ] as const
+                      ).map((mode) => (
+                        <button
+                          key={mode.id}
+                          type="button"
+                          onClick={() => setFilterMode(mode.id)}
+                          className={`px-2.5 py-1 rounded-lg text-[10px] font-medium transition-[transform,background-color] duration-150 active:scale-[0.98] cursor-pointer ${
+                            filterMode === mode.id
+                              ? "bg-white/[0.12] text-white border border-white/20"
+                              : "bg-white/[0.03] text-zinc-400 border border-white/[0.06] hover:text-zinc-200"
+                          }`}
+                        >
+                          {mode.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
                 {/* Guided Field Inputs */}
-                <div className="space-y-2.5">
-                  {fillableFields.map((field, idx) => {
-                    const label = formatFieldLabel(field.name, field.alternateName);
-                    const isMissing = missingNames.has(field.name);
+                {filteredFields.length === 0 ? (
+                  <div className="rounded-xl border border-white/[0.07] bg-[#111113] p-4 text-center text-[11px] text-zinc-400">
+                    No fields match your current filter.
+                  </div>
+                ) : (
+                  <div className="space-y-2.5">
+                    {filteredFields.map((field) => {
+                      const globalIdx = fillableFields.findIndex(
+                        (f) => f.name === field.name
+                      );
+                      const label = formatFieldLabel(field.name, field.alternateName);
+                      const isMissing = missingNames.has(field.name);
+                      const pageIdx = fieldPageIndexMap[field.name];
+                      const isFocused = focusedFieldName === field.name;
+                      const textDraft =
+                        localTextValues[field.name] ?? extractTextValue(field);
 
-                    return (
-                      <div
-                        key={field.name}
-                        className={`rounded-xl border p-3 space-y-2 transition-colors ${
-                          isMissing
-                            ? "border-red-500/50 bg-red-950/15"
-                            : "border-white/[0.07] bg-[#111113] focus-within:border-white/25"
-                        }`}
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <button
-                            type="button"
-                            onClick={() => handleFocusField(field)}
-                            className="flex items-center gap-1.5 text-left text-[11px] font-medium text-zinc-200 hover:text-white truncate cursor-pointer"
-                            title={`Jump to ${label} on PDF`}
-                          >
-                            <span className="font-mono text-[10px] tabular-nums text-zinc-500">
-                              {String(idx + 1).padStart(2, "0")}
-                            </span>
-                            <span className="truncate">{label}</span>
-                            {field.required && (
-                              <span className="text-red-400 font-bold">*</span>
-                            )}
-                          </button>
-
-                          <div className="flex items-center gap-1 shrink-0">
+                      return (
+                        <div
+                          key={field.name}
+                          ref={(el) => {
+                            cardRefs.current[field.name] = el;
+                          }}
+                          className={`rounded-xl border p-3 space-y-2 transition-colors ${
+                            isMissing
+                              ? "border-red-500/50 bg-red-950/15"
+                              : isFocused
+                              ? "border-white/25 bg-[#111113]"
+                              : "border-white/[0.07] bg-[#111113] focus-within:border-white/25"
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
                             <button
                               type="button"
                               onClick={() => handleFocusField(field)}
-                              className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-white/[0.06] cursor-pointer"
-                              title="Locate on page"
+                              className="flex items-center gap-1.5 text-left text-[11px] font-medium text-zinc-200 hover:text-white truncate cursor-pointer"
+                              title={`Jump to ${label} on PDF`}
                             >
-                              <ChevronRight className="w-3 h-3" />
+                              <span className="font-mono text-[10px] tabular-nums text-zinc-500">
+                                {String(globalIdx + 1).padStart(2, "0")}
+                              </span>
+                              <span className="truncate">{label}</span>
+                              {field.required && (
+                                <span className="text-red-400 font-bold">*</span>
+                              )}
                             </button>
+
+                            <div className="flex items-center gap-1 shrink-0">
+                              {typeof pageIdx === "number" && (
+                                <span className="px-1.5 py-0.5 rounded bg-white/[0.05] border border-white/[0.07] text-[9px] font-mono tabular-nums text-zinc-400">
+                                  P.{pageIdx + 1}
+                                </span>
+                              )}
+                              <button
+                                type="button"
+                                onClick={() => handleFocusField(field)}
+                                className="p-1 rounded text-zinc-500 hover:text-zinc-200 hover:bg-white/[0.06] cursor-pointer"
+                                title="Locate on page"
+                              >
+                                <ChevronRight className="w-3 h-3 translate-x-[0.5px]" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteField(field)}
+                                className="p-1 rounded text-zinc-600 hover:text-red-400 hover:bg-white/[0.06] cursor-pointer"
+                                title="Delete field"
+                              >
+                                <Trash2 className="w-3 h-3" />
+                              </button>
+                            </div>
+                          </div>
+
+                          {field.kind === "text" &&
+                            (field.multiline ? (
+                              <textarea
+                                ref={(el) => {
+                                  inputRefs.current[field.name] = el;
+                                }}
+                                rows={3}
+                                disabled={field.readOnly}
+                                value={textDraft}
+                                onFocus={() => handleInputFocus(field)}
+                                onBlur={() => handleInputBlur(field)}
+                                onChange={(e) =>
+                                  handleTextDraftChange(field, e.target.value)
+                                }
+                                placeholder={`Enter ${label.toLowerCase()}...`}
+                                className="w-full px-2.5 py-1.5 rounded-lg border border-white/10 bg-black/50 text-xs text-white placeholder:text-zinc-600 focus:outline-none focus:border-white/35 resize-y"
+                              />
+                            ) : (
+                              <input
+                                ref={(el) => {
+                                  inputRefs.current[field.name] = el;
+                                }}
+                                type={field.password ? "password" : "text"}
+                                disabled={field.readOnly}
+                                value={textDraft}
+                                onFocus={() => handleInputFocus(field)}
+                                onBlur={() => handleInputBlur(field)}
+                                onChange={(e) =>
+                                  handleTextDraftChange(field, e.target.value)
+                                }
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") {
+                                    e.preventDefault();
+                                    handleAdvanceNext(field);
+                                  }
+                                }}
+                                placeholder={`Enter ${label.toLowerCase()}...`}
+                                className="w-full px-2.5 py-1.5 rounded-lg border border-white/10 bg-black/50 text-xs text-white placeholder:text-zinc-600 focus:outline-none focus:border-white/35"
+                              />
+                            ))}
+
+                          {field.kind === "checkbox" && (
+                            <label className="flex items-center gap-2.5 cursor-pointer py-0.5">
+                              <input
+                                ref={(el) => {
+                                  inputRefs.current[field.name] = el;
+                                }}
+                                type="checkbox"
+                                disabled={field.readOnly}
+                                checked={field.checked}
+                                onFocus={() => handleFocusField(field)}
+                                onChange={(e) =>
+                                  handleSetFieldValue(field, {
+                                    checked: e.target.checked,
+                                  })
+                                }
+                                className="w-4 h-4 rounded border-white/20 bg-black accent-emerald-500 cursor-pointer"
+                              />
+                              <span className="text-xs text-zinc-300">
+                                {field.checked ? "Checked" : "Unchecked"}
+                              </span>
+                            </label>
+                          )}
+
+                          {field.kind === "radio" && (
+                            <div className="flex flex-wrap gap-1.5">
+                              {Array.from(
+                                new Set(
+                                  field.widgets
+                                    .map((w) => w.exportValue)
+                                    .filter((v) => v && v !== "Off")
+                                )
+                              ).map((opt) => {
+                                const selected = field.value === opt;
+                                return (
+                                  <button
+                                    key={opt}
+                                    type="button"
+                                    disabled={field.readOnly}
+                                    onClick={() =>
+                                      handleSetFieldValue(field, {
+                                        value:
+                                          selected && !field.noToggleToOff
+                                            ? "Off"
+                                            : opt,
+                                      })
+                                    }
+                                    className={`px-2.5 py-1 rounded-lg border text-[11px] font-medium transition-colors cursor-pointer ${
+                                      selected
+                                        ? "border-white/30 bg-white/[0.14] text-white"
+                                        : "border-white/10 bg-black/40 text-zinc-400 hover:text-zinc-200"
+                                    }`}
+                                  >
+                                    {opt}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          )}
+
+                          {field.kind === "combobox" &&
+                            (field.edit ? (
+                              <>
+                                <input
+                                  ref={(el) => {
+                                    inputRefs.current[field.name] = el;
+                                  }}
+                                  type="text"
+                                  list={`combo-opts-${field.name}`}
+                                  disabled={field.readOnly}
+                                  value={textDraft}
+                                  onFocus={() => handleInputFocus(field)}
+                                  onBlur={() => handleInputBlur(field)}
+                                  onChange={(e) =>
+                                    handleTextDraftChange(field, e.target.value)
+                                  }
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Enter") {
+                                      e.preventDefault();
+                                      handleAdvanceNext(field);
+                                    }
+                                  }}
+                                  placeholder={`Select or type ${label.toLowerCase()}...`}
+                                  className="w-full px-2.5 py-1.5 rounded-lg border border-white/10 bg-black/60 text-xs text-white placeholder:text-zinc-600 focus:outline-none focus:border-white/35"
+                                />
+                                <datalist id={`combo-opts-${field.name}`}>
+                                  {field.options.map((o) => (
+                                    <option key={o.value} value={o.value}>
+                                      {o.label || o.value}
+                                    </option>
+                                  ))}
+                                </datalist>
+                              </>
+                            ) : (
+                              <select
+                                ref={(el) => {
+                                  inputRefs.current[field.name] = el;
+                                }}
+                                disabled={field.readOnly}
+                                value={field.value}
+                                onFocus={() => handleFocusField(field)}
+                                onChange={(e) =>
+                                  handleSetFieldValue(field, { value: e.target.value })
+                                }
+                                className="w-full px-2.5 py-1.5 rounded-lg border border-white/10 bg-black/60 text-xs text-white focus:outline-none focus:border-white/35"
+                              >
+                                <option value="">Select option...</option>
+                                {field.options.map((o) => (
+                                  <option key={o.value} value={o.value}>
+                                    {o.label || o.value}
+                                  </option>
+                                ))}
+                              </select>
+                            ))}
+
+                          {field.kind === "listbox" && (
+                            <div className="flex flex-wrap gap-1.5">
+                              {field.options.map((o) => {
+                                const active = field.selectedValues.includes(o.value);
+                                return (
+                                  <button
+                                    key={o.value}
+                                    type="button"
+                                    disabled={field.readOnly}
+                                    onClick={() => {
+                                      const next = field.multiSelect
+                                        ? active
+                                          ? field.selectedValues.filter(
+                                              (v) => v !== o.value
+                                            )
+                                          : [...field.selectedValues, o.value]
+                                        : [o.value];
+                                      handleSetFieldValue(field, {
+                                        selectedValues: next,
+                                      });
+                                    }}
+                                    className={`px-2.5 py-1 rounded-lg border text-[11px] cursor-pointer ${
+                                      active
+                                        ? "border-white/30 bg-white/[0.14] text-white"
+                                        : "border-white/10 bg-black/40 text-zinc-400"
+                                    }`}
+                                  >
+                                    {o.label || o.value}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          )}
+
+                          {field.kind === "signature" && (
                             <button
                               type="button"
-                              onClick={() => handleDeleteField(field)}
-                              className="p-1 rounded text-zinc-600 hover:text-red-400 hover:bg-white/[0.06] cursor-pointer"
-                              title="Delete field"
+                              onClick={onOpenSignature}
+                              className="w-full flex items-center justify-center gap-1.5 py-1.5 rounded-lg border border-white/15 bg-white/[0.05] text-zinc-200 hover:bg-white/[0.1] cursor-pointer"
                             >
-                              <Trash2 className="w-3 h-3" />
+                              <PenTool className="w-3.5 h-3.5" />
+                              <span>Open E-Signature Studio</span>
                             </button>
-                          </div>
+                          )}
+
+                          {/* Smart Quick-Insert Chips for focused text / editable combo inputs */}
+                          {isFocused &&
+                            !field.readOnly &&
+                            ((field.kind === "text" && !field.password) ||
+                              (field.kind === "combobox" && field.edit)) && (
+                              <div className="flex flex-wrap items-center gap-1 pt-0.5">
+                                {quickChips.map((chip) => (
+                                  <button
+                                    key={chip.id}
+                                    type="button"
+                                    onMouseDown={(e) => e.preventDefault()}
+                                    onClick={() => handleApplyQuickChip(field, chip.value)}
+                                    title={`Insert "${chip.value}"`}
+                                    className="px-2 py-0.5 rounded-md border border-white/10 bg-white/[0.04] text-[10px] font-medium text-zinc-300 hover:text-white hover:bg-white/[0.1] tabular-nums transition-[transform,background-color] duration-150 active:scale-[0.98] cursor-pointer"
+                                  >
+                                    {chip.label}
+                                  </button>
+                                ))}
+                              </div>
+                            )}
+
+                          {isMissing && (
+                            <div className="flex items-center gap-1 text-[10px] text-red-400">
+                              <AlertCircle className="w-3 h-3" />
+                              <span>Required field</span>
+                            </div>
+                          )}
                         </div>
-
-                        {field.kind === "text" && (
-                          field.multiline ? (
-                            <textarea
-                              ref={(el) => {
-                                inputRefs.current[field.name] = el;
-                              }}
-                              rows={3}
-                              disabled={field.readOnly}
-                              value={field.value}
-                              onFocus={() => handleFocusField(field)}
-                              onChange={(e) =>
-                                handleSetFieldValue(field, { value: e.target.value })
-                              }
-                              placeholder={`Enter ${label.toLowerCase()}...`}
-                              className="w-full px-2.5 py-1.5 rounded-lg border border-white/10 bg-black/50 text-xs text-white placeholder:text-zinc-600 focus:outline-none focus:border-white/35 resize-y"
-                            />
-                          ) : (
-                            <input
-                              ref={(el) => {
-                                inputRefs.current[field.name] = el;
-                              }}
-                              type={field.password ? "password" : "text"}
-                              disabled={field.readOnly}
-                              value={field.value}
-                              onFocus={() => handleFocusField(field)}
-                              onChange={(e) =>
-                                handleSetFieldValue(field, { value: e.target.value })
-                              }
-                              onKeyDown={(e) => {
-                                if (e.key === "Enter") {
-                                  e.preventDefault();
-                                  handleAdvanceNext(idx);
-                                }
-                              }}
-                              placeholder={`Enter ${label.toLowerCase()}...`}
-                              className="w-full px-2.5 py-1.5 rounded-lg border border-white/10 bg-black/50 text-xs text-white placeholder:text-zinc-600 focus:outline-none focus:border-white/35"
-                            />
-                          )
-                        )}
-
-                        {field.kind === "checkbox" && (
-                          <label className="flex items-center gap-2.5 cursor-pointer py-0.5">
-                            <input
-                              ref={(el) => {
-                                inputRefs.current[field.name] = el;
-                              }}
-                              type="checkbox"
-                              disabled={field.readOnly}
-                              checked={field.checked}
-                              onFocus={() => handleFocusField(field)}
-                              onChange={(e) =>
-                                handleSetFieldValue(field, {
-                                  checked: e.target.checked,
-                                })
-                              }
-                              className="w-4 h-4 rounded border-white/20 bg-black accent-emerald-500 cursor-pointer"
-                            />
-                            <span className="text-xs text-zinc-300">
-                              {field.checked ? "Checked" : "Unchecked"}
-                            </span>
-                          </label>
-                        )}
-
-                        {field.kind === "radio" && (
-                          <div className="flex flex-wrap gap-1.5">
-                            {Array.from(
-                              new Set(
-                                field.widgets
-                                  .map((w) => w.exportValue)
-                                  .filter((v) => v && v !== "Off")
-                              )
-                            ).map((opt) => {
-                              const selected = field.value === opt;
-                              return (
-                                <button
-                                  key={opt}
-                                  type="button"
-                                  disabled={field.readOnly}
-                                  onClick={() =>
-                                    handleSetFieldValue(field, {
-                                      value: selected && !field.noToggleToOff ? "Off" : opt,
-                                    })
-                                  }
-                                  className={`px-2.5 py-1 rounded-lg border text-[11px] font-medium transition-colors cursor-pointer ${
-                                    selected
-                                      ? "border-white/30 bg-white/[0.14] text-white"
-                                      : "border-white/10 bg-black/40 text-zinc-400 hover:text-zinc-200"
-                                  }`}
-                                >
-                                  {opt}
-                                </button>
-                              );
-                            })}
-                          </div>
-                        )}
-
-                        {field.kind === "combobox" && (
-                          <select
-                            ref={(el) => {
-                              inputRefs.current[field.name] = el;
-                            }}
-                            disabled={field.readOnly}
-                            value={field.value}
-                            onFocus={() => handleFocusField(field)}
-                            onChange={(e) =>
-                              handleSetFieldValue(field, { value: e.target.value })
-                            }
-                            className="w-full px-2.5 py-1.5 rounded-lg border border-white/10 bg-black/60 text-xs text-white focus:outline-none focus:border-white/35"
-                          >
-                            <option value="">Select option...</option>
-                            {field.options.map((o) => (
-                              <option key={o.value} value={o.value}>
-                                {o.label || o.value}
-                              </option>
-                            ))}
-                          </select>
-                        )}
-
-                        {field.kind === "listbox" && (
-                          <div className="flex flex-wrap gap-1.5">
-                            {field.options.map((o) => {
-                              const active = field.selectedValues.includes(o.value);
-                              return (
-                                <button
-                                  key={o.value}
-                                  type="button"
-                                  disabled={field.readOnly}
-                                  onClick={() => {
-                                    const next = field.multiSelect
-                                      ? active
-                                        ? field.selectedValues.filter((v) => v !== o.value)
-                                        : [...field.selectedValues, o.value]
-                                      : [o.value];
-                                    handleSetFieldValue(field, {
-                                      selectedValues: next,
-                                    });
-                                  }}
-                                  className={`px-2.5 py-1 rounded-lg border text-[11px] cursor-pointer ${
-                                    active
-                                      ? "border-white/30 bg-white/[0.14] text-white"
-                                      : "border-white/10 bg-black/40 text-zinc-400"
-                                  }`}
-                                >
-                                  {o.label || o.value}
-                                </button>
-                              );
-                            })}
-                          </div>
-                        )}
-
-                        {field.kind === "signature" && (
-                          <button
-                            type="button"
-                            onClick={onOpenSignature}
-                            className="w-full flex items-center justify-center gap-1.5 py-1.5 rounded-lg border border-white/15 bg-white/[0.05] text-zinc-200 hover:bg-white/[0.1] cursor-pointer"
-                          >
-                            <PenTool className="w-3.5 h-3.5" />
-                            <span>Open E-Signature Studio</span>
-                          </button>
-                        )}
-
-                        {isMissing && (
-                          <div className="flex items-center gap-1 text-[10px] text-red-400">
-                            <AlertCircle className="w-3 h-3" />
-                            <span>Required field</span>
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
+                      );
+                    })}
+                  </div>
+                )}
               </>
             )}
           </>
@@ -759,44 +1440,86 @@ export function FormFillerPanel({
         {/* ======================================================= */}
         {activeTab === "build" && (
           <div className="space-y-4">
-            <div className="rounded-[18px] border border-white/[0.08] bg-[#111113] p-4 space-y-3">
+            {/* Target Page Selector */}
+            <div className="flex items-center justify-between gap-2 rounded-[16px] border border-white/[0.08] bg-[#111113] px-3 py-2.5">
+              <span className="text-[11px] font-medium text-zinc-300">
+                Target Page
+              </span>
+              <select
+                value={targetPageIndex}
+                onChange={(e) => setTargetPageIndex(Number(e.target.value))}
+                className="px-2.5 py-1 rounded-lg border border-white/10 bg-black/60 text-xs font-mono tabular-nums text-white focus:outline-none focus:border-white/35"
+              >
+                {Array.from({ length: pageCount }).map((_, idx) => (
+                  <option key={idx} value={idx}>
+                    Page {idx + 1}
+                    {idx === currentPageIndex ? " (Active)" : ""}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="rounded-[20px] border border-white/[0.08] bg-[#111113] p-4 space-y-3">
               <div className="flex items-center justify-between">
                 <h4 className="text-xs font-semibold text-white">
                   Auto-Detect Flat Form Fields
                 </h4>
                 <span className="text-[10px] font-mono tabular-nums text-zinc-500">
-                  Page {currentPageIndex + 1}
+                  Page {targetPageIndex + 1}/{pageCount}
                 </span>
               </div>
               <p className="text-[11px] text-zinc-400 leading-relaxed">
-                Scans the current page for blank lines (
+                Scans for blank lines (
                 <code className="text-zinc-300">Name: ____</code>), trailing
                 prompts, and <code className="text-zinc-300">[ ]</code>{" "}
-                checkboxes, turning a flat PDF into an interactive AcroForm.
+                checkboxes, converting flat PDFs into interactive AcroForms
+                without duplicating existing fields.
               </p>
-              <button
-                type="button"
-                disabled={isDetecting}
-                onClick={handleAutoDetectPageFields}
-                className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded-xl bg-[#fafafa] text-zinc-950 text-xs font-semibold hover:bg-white disabled:opacity-60 transition-[transform,background-color] duration-150 active:scale-[0.98] cursor-pointer"
-              >
-                {isDetecting ? (
-                  <div className="w-3.5 h-3.5 rounded-full border-2 border-zinc-900 border-t-transparent animate-spin" />
-                ) : (
-                  <ScanSearch className="w-3.5 h-3.5" />
+              <div className="space-y-2">
+                <button
+                  type="button"
+                  disabled={isDetecting !== null}
+                  onClick={handleAutoDetectPageFields}
+                  className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded-xl bg-[#fafafa] text-zinc-950 text-xs font-semibold hover:bg-white disabled:opacity-60 transition-[transform,background-color] duration-150 active:scale-[0.98] cursor-pointer"
+                >
+                  {isDetecting === "page" ? (
+                    <div className="w-3.5 h-3.5 rounded-full border-2 border-zinc-900 border-t-transparent animate-spin" />
+                  ) : (
+                    <ScanSearch className="w-3.5 h-3.5" />
+                  )}
+                  <span className="tabular-nums">
+                    {isDetecting === "page"
+                      ? "Scanning Page..."
+                      : `Auto-Detect Page ${targetPageIndex + 1}`}
+                  </span>
+                </button>
+
+                {pageCount > 1 && (
+                  <button
+                    type="button"
+                    disabled={isDetecting !== null}
+                    onClick={handleAutoDetectAllPages}
+                    className="w-full flex items-center justify-center gap-2 py-2 px-3 rounded-xl border border-white/10 bg-white/[0.04] text-zinc-200 text-xs font-medium hover:bg-white/[0.08] disabled:opacity-60 transition-[transform,background-color] duration-150 active:scale-[0.98] cursor-pointer"
+                  >
+                    {isDetecting === "all" ? (
+                      <div className="w-3.5 h-3.5 rounded-full border-2 border-white/70 border-t-transparent animate-spin" />
+                    ) : (
+                      <ScanSearch className="w-3.5 h-3.5 text-zinc-300" />
+                    )}
+                    <span className="tabular-nums">
+                      {isDetecting === "all"
+                        ? "Scanning All Pages..."
+                        : `Scan Entire Document (${pageCount} Pages)`}
+                    </span>
+                  </button>
                 )}
-                <span>
-                  {isDetecting
-                    ? "Scanning Page..."
-                    : `Auto-Detect Fields on Page ${currentPageIndex + 1}`}
-                </span>
-              </button>
+              </div>
             </div>
 
-            <div className="rounded-[18px] border border-white/[0.08] bg-[#111113] p-4 space-y-3">
+            <div className="rounded-[20px] border border-white/[0.08] bg-[#111113] p-4 space-y-3">
               <h4 className="text-xs font-semibold text-white">
                 Place Interactive Field on Page{" "}
-                <span className="tabular-nums">{currentPageIndex + 1}</span>
+                <span className="tabular-nums">{targetPageIndex + 1}</span>
               </h4>
               <input
                 type="text"
@@ -830,7 +1553,51 @@ export function FormFillerPanel({
                   <Calendar className="w-4 h-4 text-zinc-300" />
                   <span className="text-[11px] font-medium">+ Date</span>
                 </button>
+                <button
+                  type="button"
+                  onClick={() => handleQuickAddField("multiline")}
+                  className="flex flex-col items-center justify-center gap-1.5 py-2.5 px-2 rounded-xl border border-white/10 bg-white/[0.03] hover:bg-white/[0.08] text-zinc-200 transition-[transform,background-color] duration-150 active:scale-[0.98] cursor-pointer"
+                >
+                  <AlignLeft className="w-4 h-4 text-zinc-300" />
+                  <span className="text-[11px] font-medium">+ Notes</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowDropdownBuilder((prev) => !prev)}
+                  className={`col-span-2 flex flex-col items-center justify-center gap-1.5 py-2.5 px-2 rounded-xl border transition-[transform,background-color] duration-150 active:scale-[0.98] cursor-pointer ${
+                    showDropdownBuilder
+                      ? "border-white/30 bg-white/[0.1] text-white"
+                      : "border-white/10 bg-white/[0.03] hover:bg-white/[0.08] text-zinc-200"
+                  }`}
+                >
+                  <ChevronDown className="w-4 h-4 text-zinc-300" />
+                  <span className="text-[11px] font-medium">+ Dropdown</span>
+                </button>
               </div>
+
+              {showDropdownBuilder && (
+                <div className="rounded-xl border border-white/10 bg-black/40 p-3 space-y-2">
+                  <label className="block text-[10px] font-medium text-zinc-400">
+                    Dropdown Options (comma-separated)
+                  </label>
+                  <input
+                    type="text"
+                    value={dropdownOptionsText}
+                    onChange={(e) => setDropdownOptionsText(e.target.value)}
+                    placeholder="Yes, No, N/A"
+                    className="w-full px-2.5 py-1.5 rounded-lg border border-white/10 bg-[#111113] text-xs text-white placeholder:text-zinc-600 focus:outline-none focus:border-white/35"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => handleQuickAddField("dropdown")}
+                    className="w-full py-1.5 px-3 rounded-lg bg-[#fafafa] text-zinc-950 text-[11px] font-semibold hover:bg-white transition-[transform,background-color] duration-150 active:scale-[0.98] cursor-pointer"
+                  >
+                    Insert Dropdown on Page{" "}
+                    <span className="tabular-nums">{targetPageIndex + 1}</span>
+                  </button>
+                </div>
+              )}
+
               <p className="text-[11px] text-zinc-500">
                 Tip: In the PDF toolbar, click <strong className="text-zinc-300">Insert</strong> or drag fields directly on the canvas to reposition or resize them.
               </p>

@@ -24,26 +24,13 @@ interface TextItemSpan {
 }
 
 /**
- * Scans a flat PDF page for common fillable form patterns:
- * 1. Underscore blanks ("Name: __________", "Date: _______", "_______")
- * 2. Empty checkbox glyphs ("[ ]", "☐", "□")
- * 3. Trailing colon labels with open space to the right ("Full Name:", "Email Address:")
- *
- * Returns positioned field drafts ready for `viewer.get("form").create(...)`.
+ * Internal single-page field scanner operating on an already-loaded pdfjs document.
  */
-export async function detectFormFieldsOnPage(
-  blob: Blob,
-  pageIndex: number
+async function detectFieldsOnPdfPage(
+  pdf: any,
+  pageIndex: number,
+  usedNames: Set<string>
 ): Promise<DetectedFieldDraft[]> {
-  if (typeof window === "undefined" || !blob) return [];
-
-  const pdfjs = await getPdfjsLib();
-  if (!pdfjs) return [];
-
-  const buffer = await blob.arrayBuffer();
-  const clone = new Uint8Array(buffer.slice(0));
-  const pdf = await pdfjs.getDocument({ data: clone }).promise;
-
   if (pageIndex < 0 || pageIndex >= pdf.numPages) return [];
 
   const page = await pdf.getPage(pageIndex + 1);
@@ -70,7 +57,7 @@ export async function detectFormFieldsOnPage(
     });
   }
 
-  // Group spans into visual rows (within 5pt vertical tolerance)
+  // Group spans into visual rows (within 6pt vertical tolerance)
   spans.sort((a, b) => a.yTop - b.yTop || a.x - b.x);
   const rows: TextItemSpan[][] = [];
   for (const span of spans) {
@@ -83,7 +70,6 @@ export async function detectFormFieldsOnPage(
   }
 
   const detected: DetectedFieldDraft[] = [];
-  const usedNames = new Set<string>();
 
   const uniqueName = (base: string) => {
     const clean =
@@ -181,4 +167,64 @@ export async function detectFormFieldsOnPage(
   }
 
   return detected.slice(0, 35);
+}
+
+/**
+ * Scans a flat PDF page for common fillable form patterns:
+ * 1. Underscore blanks ("Name: __________", "Date: _______", "_______")
+ * 2. Empty checkbox glyphs ("[ ]", "☐", "□")
+ * 3. Trailing colon labels with open space to the right ("Full Name:", "Email Address:")
+ *
+ * Returns positioned field drafts ready for `viewer.get("form").create(...)`.
+ */
+export async function detectFormFieldsOnPage(
+  blob: Blob,
+  pageIndex: number
+): Promise<DetectedFieldDraft[]> {
+  if (typeof window === "undefined" || !blob) return [];
+
+  const pdfjs = await getPdfjsLib();
+  if (!pdfjs) return [];
+
+  const buffer = await blob.arrayBuffer();
+  const clone = new Uint8Array(buffer.slice(0));
+  const pdf = await pdfjs.getDocument({ data: clone }).promise;
+
+  try {
+    return await detectFieldsOnPdfPage(pdf, pageIndex, new Set<string>());
+  } finally {
+    await pdf.destroy?.();
+  }
+}
+
+/**
+ * Scans every page in a flat PDF document for fillable form patterns,
+ * returning deduplicated field drafts across all pages.
+ */
+export async function detectFormFieldsAllPages(
+  blob: Blob
+): Promise<DetectedFieldDraft[]> {
+  if (typeof window === "undefined" || !blob) return [];
+
+  const pdfjs = await getPdfjsLib();
+  if (!pdfjs) return [];
+
+  const buffer = await blob.arrayBuffer();
+  const clone = new Uint8Array(buffer.slice(0));
+  const pdf = await pdfjs.getDocument({ data: clone }).promise;
+
+  try {
+    const usedNames = new Set<string>();
+    const allDetected: DetectedFieldDraft[] = [];
+
+    for (let pageIndex = 0; pageIndex < pdf.numPages; pageIndex++) {
+      const pageDrafts = await detectFieldsOnPdfPage(pdf, pageIndex, usedNames);
+      allDetected.push(...pageDrafts);
+      if (allDetected.length >= 200) break;
+    }
+
+    return allDetected.slice(0, 200);
+  } finally {
+    await pdf.destroy?.();
+  }
 }
